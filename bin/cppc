@@ -1,0 +1,148 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+// Find autoloader
+$autoloadPaths = [
+    __DIR__ . '/../vendor/autoload.php',
+    __DIR__ . '/../../../autoload.php',
+];
+
+$autoloaded = false;
+foreach ($autoloadPaths as $path) {
+    if (file_exists($path)) {
+        require $path;
+        $autoloaded = true;
+        break;
+    }
+}
+
+if (!$autoloaded) {
+    fwrite(STDERR, "Error: Could not find autoloader. Run 'composer install' or build the Docker image.\n");
+    exit(1);
+}
+
+use Cppc\Compiler;
+use Cppc\ContainerFactory;
+
+function usage(): void
+{
+    fwrite(STDERR, "Usage: cppc <input.cpp> [-o <output>] [-S] [--emit-ast] [--emit-ir] [--emit-tokens]\n");
+    fwrite(STDERR, "\nOptions:\n");
+    fwrite(STDERR, "  -o <file>       Output file (default: a.out for binary, stdout for -S)\n");
+    fwrite(STDERR, "  -S, --emit-asm  Emit assembly text instead of binary\n");
+    fwrite(STDERR, "  --emit-tokens   Print token stream and exit\n");
+    fwrite(STDERR, "  --emit-ast      Print AST and exit\n");
+    fwrite(STDERR, "  --emit-ir       Print IR and exit\n");
+    fwrite(STDERR, "  -h, --help      Show this help\n");
+    exit(1);
+}
+
+$args = array_slice($argv, 1);
+if (empty($args)) {
+    usage();
+}
+
+$inputFile = null;
+$outputFile = null;
+$emitTokens = false;
+$emitAst = false;
+$emitIr = false;
+$emitAsm = false;
+
+for ($i = 0; $i < count($args); $i++) {
+    switch ($args[$i]) {
+        case '-o':
+            $outputFile = $args[++$i] ?? usage();
+            break;
+        case '-S':
+        case '--emit-asm':
+            $emitAsm = true;
+            break;
+        case '--emit-tokens':
+            $emitTokens = true;
+            break;
+        case '--emit-ast':
+            $emitAst = true;
+            break;
+        case '--emit-ir':
+            $emitIr = true;
+            break;
+        case '-h':
+        case '--help':
+            usage();
+            break;
+        default:
+            if ($inputFile === null) {
+                $inputFile = $args[$i];
+            } else {
+                fwrite(STDERR, "Error: Unexpected argument '{$args[$i]}'\n");
+                usage();
+            }
+    }
+}
+
+if ($inputFile === null) {
+    fwrite(STDERR, "Error: No input file specified\n");
+    usage();
+}
+
+if (!file_exists($inputFile)) {
+    fwrite(STDERR, "Error: Input file '{$inputFile}' not found\n");
+    exit(1);
+}
+
+try {
+    $container = ContainerFactory::create();
+    $compiler = $container->get(Compiler::class);
+    $source = file_get_contents($inputFile);
+    $sourceDir = dirname(realpath($inputFile));
+
+    if ($emitTokens) {
+        $tokens = $compiler->tokenize($source, $inputFile, $sourceDir);
+        foreach ($tokens as $token) {
+            echo $token . "\n";
+        }
+        exit(0);
+    }
+
+    if ($emitAst) {
+        $ast = $compiler->parse($source, $inputFile, $sourceDir);
+        echo $compiler->dumpAst($ast);
+        exit(0);
+    }
+
+    if ($emitIr) {
+        $ir = $compiler->generateIr($source, $inputFile, $sourceDir);
+        echo $ir;
+        exit(0);
+    }
+
+    if ($emitAsm) {
+        $assembly = $compiler->compile($source, $inputFile, $sourceDir);
+        if ($outputFile !== null) {
+            file_put_contents($outputFile, $assembly);
+            fwrite(STDERR, "Assembly written to {$outputFile}\n");
+        } else {
+            echo $assembly;
+        }
+        exit(0);
+    }
+
+    // Default: compile to ELF binary
+    $binary = $compiler->compileToElf($source, $inputFile, $sourceDir);
+    $outPath = $outputFile ?? 'a.out';
+    file_put_contents($outPath, $binary);
+    chmod($outPath, 0755);
+    fwrite(STDERR, "Binary written to {$outPath}\n");
+
+    exit(0);
+} catch (\Cppc\CompileError $e) {
+    fwrite(STDERR, "Error: {$e->getMessage()}\n");
+    exit(1);
+} catch (\Throwable $e) {
+    fwrite(STDERR, "Internal compiler error: {$e->getMessage()}\n");
+    fwrite(STDERR, $e->getTraceAsString() . "\n");
+    exit(2);
+}

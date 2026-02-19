@@ -1,0 +1,7 @@
+*.o
+*.s
+*.out
+/tmp/
+.claude/
+/vendor/
+composer.lock

@@ -1,0 +1,38 @@
+#pragma once
+
+template<typename T>
+struct vector {
+    T* _data;
+    int _size;
+    int _capacity;
+
+    void push_back(T val) {
+        if (_size >= _capacity) {
+            int newCap = _capacity * 2 + 4;
+            T* newData = new T[newCap];
+            int i = 0;
+            while (i < _size) {
+                newData[i] = _data[i];
+                i = i + 1;
+            }
+            _data = newData;
+            _capacity = newCap;
+        }
+        _data[_size] = val;
+        _size = _size + 1;
+    }
+
+    T get(int index) {
+        return _data[index];
+    }
+
+    int size() {
+        return _size;
+    }
+
+    void pop_back() {
+        if (_size > 0) { _size = _size - 1; }
+    }
+
+    void clear() { _size = 0; }
+};

@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+#
+# g++-compatible front-end for cppc.
+#
+# On the host this script re-invokes itself inside the Docker container.
+# Inside the container it hands off to the PHP compiler driver.
+#
+# Usage:  CXX=./bin/c++  in a Makefile, or directly:
+#         ./bin/c++ -Wall -std=c++17 -O2 -o program main.cpp
+#
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# ── Already inside Docker? Run the PHP driver directly. ──────────────────────
+
+if [ -n "${CPPC_DOCKER:-}" ]; then
+    exec php /app/bin/c++.php "$@"
+fi
+
+# ── Host: re-invoke via Docker ───────────────────────────────────────────────
+
+HOST_CWD="$(pwd)"
+DOCKER_EXTRA=()
+declare -A MOUNTED_DIRS=()
+
+# Ensure a host directory is bind-mounted into the container (deduplicating).
+ensure_mounted() {
+    local dir="$1"
+    if [ -z "${MOUNTED_DIRS[$dir]:-}" ]; then
+        DOCKER_EXTRA+=(-v "$dir:$dir")
+        MOUNTED_DIRS[$dir]=1
+    fi
+}
+
+# Rewrite a single path argument.  Project-internal absolute paths become
+# /app/…; external absolute paths cause their parent directory to be mounted.
+# Relative paths pass through unchanged.  The rewritten value is appended to
+# REWRITTEN_ARGS (runs in the current shell, so array mutations stick).
+rewrite_arg() {
+    local p="$1"
+    case "$p" in
+        "$PROJECT_DIR"/*)
+            local rel="${p#"$PROJECT_DIR"}"
+            REWRITTEN_ARGS+=("/app${rel}")
+            ;;
+        "$PROJECT_DIR")
+            REWRITTEN_ARGS+=("/app")
+            ;;
+        /*)
+            # Absolute path outside the project — mount its directory.
+            local dir
+            dir="$(dirname "$p")"
+            [ -d "$dir" ] || mkdir -p "$dir"
+            ensure_mounted "$dir"
+            REWRITTEN_ARGS+=("$p")
+            ;;
+        *)
+            REWRITTEN_ARGS+=("$p")
+            ;;
+    esac
+}
+
+# Map CWD into the container.
+case "$HOST_CWD" in
+    "$PROJECT_DIR"|"$PROJECT_DIR"/*)
+        REL="${HOST_CWD#"$PROJECT_DIR"}"
+        CONTAINER_CWD="/app${REL}"
+        ;;
+    *)
+        ensure_mounted "$HOST_CWD"
+        CONTAINER_CWD="$HOST_CWD"
+        ;;
+esac
+
+# Scan arguments, rewriting paths and collecting volume mounts.
+REWRITTEN_ARGS=()
+SKIP_NEXT=0
+
+for arg in "$@"; do
+    if [ "$SKIP_NEXT" -eq 1 ]; then
+        SKIP_NEXT=0
+        rewrite_arg "$arg"
+        continue
+    fi
+
+    case "$arg" in
+        -o|-I|-L|-MF|-MT|-MQ|-include|-isystem|-x|-target|-arch)
+            SKIP_NEXT=1
+            REWRITTEN_ARGS+=("$arg")
+            ;;
+        -*)
+            REWRITTEN_ARGS+=("$arg")
+            ;;
+        *)
+            rewrite_arg "$arg"
+            ;;
+    esac
+done
+
+exec docker compose \
+    -f "$PROJECT_DIR/docker-compose.yml" \
+    run --rm -T \
+    -e CPPC_DOCKER=1 \
+    -w "$CONTAINER_CWD" \
+    "${DOCKER_EXTRA[@]}" \
+    cppc /app/bin/c++.php "${REWRITTEN_ARGS[@]}"

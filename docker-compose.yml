@@ -1,0 +1,10 @@
+services:
+  cppc:
+    build: .
+    working_dir: /app
+    volumes:
+      - .:/app
+      - /app/vendor
+    environment:
+      - CPPC_DOCKER=1
+    entrypoint: ["php"]

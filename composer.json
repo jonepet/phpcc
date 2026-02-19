@@ -1,0 +1,16 @@
+{
+    "name": "jonepet/cppc",
+    "description": "A C/C++ compiler written in PHP targeting x86-64 Linux",
+    "type": "project",
+    "license": "MIT",
+    "require": {
+        "php": ">=8.5",
+        "php-di/php-di": "^7.0"
+    },
+    "autoload": {
+        "psr-4": {
+            "Cppc\\": "src/"
+        }
+    },
+    "bin": ["bin/cppc"]
+}
