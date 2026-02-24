@@ -289,6 +289,18 @@ final class Parser
             }
         }
 
+        // Parenthesized function name: `type ( name ) ( params )` — macro protection pattern.
+        // Used by libpng and others to prevent macro expansion of function names.
+        if ($name === '' && $this->check(TokenType::LeftParen) && $this->peek(1)?->type === TokenType::Identifier) {
+            $peek2 = $this->peek(2);
+            if ($peek2 !== null && $peek2->type === TokenType::RightParen) {
+                $this->advance(); // consume '('
+                $name = $this->advance()->value; // consume name
+                $this->advance(); // consume ')'
+                // Fall through to normal function/var parsing below with the extracted name
+            }
+        }
+
         // Function returning function pointer: `int (*XSynchronize(Display*, int))(Display*);`
         // Pattern: `type (*name(params))(params);`
         if ($name === '' && $this->check(TokenType::LeftParen) && $this->peek(1)?->type === TokenType::Star) {
@@ -684,6 +696,13 @@ final class Parser
             while ($this->check(TokenType::Star)) {
                 $this->advance();
                 $extraType->pointerDepth++;
+                // Skip qualifiers after '*': const, volatile, restrict
+                while ($this->check(TokenType::Const) || $this->check(TokenType::Volatile) || $this->check(TokenType::Restrict)) {
+                    if ($this->current()->type === TokenType::Const) {
+                        $extraType->isConst = true;
+                    }
+                    $this->advance();
+                }
             }
 
             $extraName = $this->expect(TokenType::Identifier)->value;
@@ -798,7 +817,34 @@ final class Parser
                             break;
                         }
                         $fpType = $this->parseType();
-                        if ($this->check(TokenType::Identifier)) {
+                        // Nested function pointer param: void *(*work)(char *)
+                        if ($this->check(TokenType::LeftParen) && $this->peek(1)?->type === TokenType::Star) {
+                            $this->advance(); // consume '('
+                            $this->advance(); // consume '*'
+                            if ($this->check(TokenType::Identifier)) {
+                                $this->advance(); // discard name
+                            }
+                            $this->expect(TokenType::RightParen);
+                            // Parse nested function pointer's parameters
+                            if ($this->check(TokenType::LeftParen)) {
+                                $this->advance(); // consume '('
+                                while (!$this->check(TokenType::RightParen) && !$this->check(TokenType::EOF)) {
+                                    if ($this->check(TokenType::Ellipsis)) {
+                                        $this->advance();
+                                        break;
+                                    }
+                                    $this->parseType();
+                                    if ($this->check(TokenType::Identifier)) {
+                                        $this->advance();
+                                    }
+                                    if ($this->check(TokenType::Comma)) {
+                                        $this->advance();
+                                    }
+                                }
+                                $this->expect(TokenType::RightParen);
+                            }
+                            $fpType->pointerDepth = 1; // function pointers are pointer-sized
+                        } elseif ($this->check(TokenType::Identifier)) {
                             $this->advance(); // discard parameter name
                         }
                         // Skip array notation in function pointer params: `In[]`
@@ -967,6 +1013,38 @@ final class Parser
         if ($cur->type->isTypeKeyword()) {
             $baseName = $cur->value;
             $this->advance();
+            // C99 _Complex / __complex__ modifier after base type (e.g., `double _Complex`)
+            if ($this->check(TokenType::Identifier)
+                && ($this->current()->value === '_Complex' || $this->current()->value === '__complex__'
+                    || $this->current()->value === '_Imaginary')
+            ) {
+                $this->advance(); // skip — complex math not implemented, treat as base type
+            }
+        } elseif ($cur->type === TokenType::Identifier
+            && ($cur->value === '_Complex' || $cur->value === '__complex__' || $cur->value === '_Imaginary')
+        ) {
+            // C99 _Complex before base type (e.g., `_Complex double`, `_Complex _Float32`)
+            $this->advance();
+            if ($this->current()->type->isTypeKeyword()) {
+                $baseName = $this->current()->value;
+                $this->advance();
+            } elseif ($this->check(TokenType::Identifier) && str_starts_with($this->current()->value, '_Float')) {
+                $baseName = str_contains($this->current()->value, '32') ? 'float' : 'double';
+                $this->advance();
+            }
+        } elseif ($cur->type === TokenType::Identifier && ($cur->value === '_Float32' || $cur->value === '_Float32x'
+            || $cur->value === '_Float64' || $cur->value === '_Float64x'
+            || $cur->value === '_Float128' || $cur->value === '_Float128x')
+        ) {
+            // GCC extended float types — treat as float/double for compatibility.
+            $baseName = str_contains($cur->value, '32') ? 'float' : 'double';
+            $this->advance();
+            // May be preceded or followed by _Complex
+            if ($this->check(TokenType::Identifier)
+                && ($this->current()->value === '_Complex' || $this->current()->value === '__complex__')
+            ) {
+                $this->advance();
+            }
         } elseif ($cur->type === TokenType::Identifier && ($cur->value === '__int128' || $cur->value === '__int128_t' || $cur->value === '__uint128_t')) {
             // Treat 128-bit integer types as long long (aliased for compatibility).
             $baseName = 'long long';
@@ -1433,9 +1511,33 @@ final class Parser
                         }
                         $alias = $this->expect(TokenType::Identifier)->value;
                         $this->skipGccExtensions();
-                        $this->typeNames[$alias] = true;
-                        $typedefNodes[] = (new TypedefDeclaration($type, $alias))
-                            ->setLocation($tok->line, $tok->column, $tok->file);
+
+                        // Array typedef: `typedef struct Tag Alias[N];`
+                        if ($this->check(TokenType::LeftBracket)) {
+                            $arrSize = null;
+                            while ($this->check(TokenType::LeftBracket)) {
+                                $this->advance();
+                                $dimSize = null;
+                                if (!$this->check(TokenType::RightBracket)) {
+                                    $sizeExpr = $this->parseExpression();
+                                    if ($sizeExpr instanceof IntLiteral) {
+                                        $dimSize = $sizeExpr->value;
+                                    }
+                                }
+                                $this->expect(TokenType::RightBracket);
+                                if ($dimSize !== null) {
+                                    $arrSize = $arrSize !== null ? $arrSize * $dimSize : $dimSize;
+                                }
+                            }
+                            $arrType = TypeNode::array($type, $arrSize);
+                            $this->typeNames[$alias] = true;
+                            $typedefNodes[] = (new TypedefDeclaration($arrType, $alias))
+                                ->setLocation($tok->line, $tok->column, $tok->file);
+                        } else {
+                            $this->typeNames[$alias] = true;
+                            $typedefNodes[] = (new TypedefDeclaration($type, $alias))
+                                ->setLocation($tok->line, $tok->column, $tok->file);
+                        }
                     } while ($this->check(TokenType::Comma) && $this->advance() !== null);
 
                     $this->expect(TokenType::Semicolon);
@@ -1559,6 +1661,10 @@ final class Parser
         // or function pointer typedef: `typedef int (*Comparator)(int, int);`
         $type  = $this->parseType();
 
+        // Skip GCC __attribute__ between type and declarator name, e.g.:
+        // typedef _Complex float __attribute__((mode(TC))) fftwq_complex;
+        $this->skipGccExtensions();
+
         // Function pointer typedef: typedef <ret> (*<alias>)(<params>);
         // Supports comma-separated aliases sharing the same base return type:
         //   typedef void *(*A)(size_t), (*B)(void *), *(*C)(void *, size_t);
@@ -1672,17 +1778,24 @@ final class Parser
                 ->setLocation($tok->line, $tok->column, $tok->file);
         }
 
-        // Array typedef: `typedef T name[size];`
+        // Array typedef: `typedef T name[size];` or multi-dimensional `typedef T name[N][M];`
         if ($this->check(TokenType::LeftBracket)) {
-            $this->advance(); // consume '['
             $arrSize = null;
-            if (!$this->check(TokenType::RightBracket)) {
-                $sizeExpr = $this->parseExpression();
-                if ($sizeExpr instanceof IntLiteral) {
-                    $arrSize = $sizeExpr->value;
+            while ($this->check(TokenType::LeftBracket)) {
+                $this->advance(); // consume '['
+                $dimSize = null;
+                if (!$this->check(TokenType::RightBracket)) {
+                    $sizeExpr = $this->parseExpression();
+                    if ($sizeExpr instanceof IntLiteral) {
+                        $dimSize = $sizeExpr->value;
+                    }
+                }
+                $this->expect(TokenType::RightBracket);
+                // Flatten multi-dimensional: multiply sizes together
+                if ($dimSize !== null) {
+                    $arrSize = $arrSize !== null ? $arrSize * $dimSize : $dimSize;
                 }
             }
-            $this->expect(TokenType::RightBracket);
             $this->expect(TokenType::Semicolon);
 
             $arrType = TypeNode::array($type, $arrSize);
@@ -2318,7 +2431,7 @@ final class Parser
                 $symbol = $this->parseOperatorSymbol();
                 $memberName = 'operator' . $symbol;
             } else {
-                $memberName = $this->expect(TokenType::Identifier)->value;
+                $memberName = $this->expectIdentifierOrKeyword();
             }
 
             return (new MemberAccessExpr($left, $memberName, $isArrow))
@@ -2407,6 +2520,35 @@ final class Parser
 
         if ($this->looksLikeCastType()) {
             $castType = $this->parseType();
+
+            // Function pointer cast: (void (*)(params)) expr
+            // After parsing the return type, check for (*) which indicates a function pointer.
+            if ($this->check(TokenType::LeftParen) && $this->peek(1)?->type === TokenType::Star) {
+                $this->advance(); // consume '('
+                $this->advance(); // consume '*'
+                $this->expect(TokenType::RightParen); // consume ')'
+                // Parse parameter types
+                $this->expect(TokenType::LeftParen);
+                while (!$this->check(TokenType::RightParen) && !$this->check(TokenType::EOF)) {
+                    if ($this->check(TokenType::Ellipsis)) {
+                        $this->advance();
+                        break;
+                    }
+                    $this->parseType();
+                    if ($this->check(TokenType::Identifier)
+                        && !$this->match(TokenType::Comma, TokenType::RightParen)
+                    ) {
+                        $this->advance();
+                    }
+                    if (!$this->check(TokenType::RightParen)) {
+                        $this->expect(TokenType::Comma);
+                    }
+                }
+                $this->expect(TokenType::RightParen); // close params
+                // Function pointer is always pointer-sized
+                $castType->pointerDepth = 1;
+            }
+
             $this->expect(TokenType::RightParen);
             $expr = $this->parseExpression(Precedence::PREFIX - 1);
             return (new CastExpr($castType, $expr, 'c_style'))
@@ -2834,6 +2976,27 @@ final class Parser
     private function check(TokenType $type): bool
     {
         return $this->current()->type === $type;
+    }
+
+    /**
+     * Consume the current token as a member name.
+     * After `.` or `->`, C allows any identifier including words that the
+     * lexer tokenises as keywords (e.g. X11's `visual_info->class`).
+     */
+    private function expectIdentifierOrKeyword(): string
+    {
+        $tok = $this->current();
+        if ($tok->type === TokenType::Identifier) {
+            $this->advance();
+            return $tok->value;
+        }
+        // Accept any keyword token as a member name — in C, keywords are
+        // valid struct/union member identifiers.
+        if ($tok->type->isKeyword()) {
+            $this->advance();
+            return $tok->value;
+        }
+        $this->error("Expected identifier or keyword as member name");
     }
 
     /** @return never */

@@ -183,4 +183,44 @@ enum TokenType: string
             default => false,
         };
     }
+
+    /**
+     * Whether this token type is a language keyword (as opposed to an
+     * operator, literal, punctuation, or identifier).  Used to allow
+     * keywords as struct/union member names in C (e.g. X11's `->class`).
+     */
+    public function isKeyword(): bool
+    {
+        return match ($this) {
+            // Types
+            self::Int, self::Char, self::Bool, self::Void,
+            self::Float, self::Double, self::Long, self::Short,
+            self::Unsigned, self::Signed, self::Auto,
+            // Qualifiers
+            self::Const, self::Static, self::Extern, self::Inline,
+            self::Virtual, self::Volatile, self::Register, self::Restrict,
+            self::Mutable, self::Constexpr, self::ThreadLocal,
+            // Control flow
+            self::If, self::Else, self::While, self::For, self::Do,
+            self::Switch, self::Case, self::Default, self::Break,
+            self::Continue, self::Return, self::Goto,
+            // OOP
+            self::Class_, self::Struct, self::Public, self::Private,
+            self::Protected, self::Virtual, self::Override, self::New,
+            self::Delete, self::This, self::Operator,
+            // Advanced
+            self::Namespace, self::Using, self::Template, self::Typename,
+            self::Enum, self::Union, self::Typedef, self::Sizeof,
+            self::Friend, self::Explicit, self::Pure,
+            // Casts
+            self::StaticCast, self::DynamicCast, self::ReinterpretCast,
+            self::ConstCast,
+            // Exceptions
+            self::Try, self::Catch, self::Throw,
+            // Other
+            self::Alignof, self::Alignas, self::Noexcept, self::Decltype,
+            self::StaticAssert => true,
+            default => false,
+        };
+    }
 }

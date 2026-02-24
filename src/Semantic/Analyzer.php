@@ -361,6 +361,12 @@ class Analyzer
     {
         if ($decl instanceof FunctionDeclaration) {
             $this->collectFunction($decl, null);
+        } elseif ($decl instanceof BlockStatement) {
+            // Comma-separated declarations (e.g. `extern int f(int), g(char);`)
+            // are wrapped in a BlockStatement by the parser.
+            foreach ($decl->statements as $inner) {
+                $this->collectTopLevelDecl($inner);
+            }
         } elseif ($decl instanceof ClassDeclaration) {
             $this->collectClass($decl);
         } elseif ($decl instanceof EnumDeclaration) {
@@ -599,32 +605,42 @@ class Analyzer
         $classSym->size = $offset > 0 ? (int)(ceil($offset / $maxAlign) * $maxAlign) : 0;
     }
 
+    private int $typeSizeDepth = 0;
+
     private function resolveTypeSize(TypeNode $type): int
     {
         if ($type->pointerDepth > 0 || $type->isReference) {
             return 8;
         }
-        if ($type->isArrayType()) {
-            $elemSize = $this->resolveTypeSize($type->arrayElementType);
-            return $type->arraySizeValue !== null ? $elemSize * $type->arraySizeValue : 0;
-        }
-        $builtIn = ['int', 'char', 'bool', 'long', 'short', 'float', 'double', 'void'];
-        if (in_array($type->baseName, $builtIn, true)) {
+        if ($this->typeSizeDepth > 10) {
             return $type->sizeInBytes();
         }
-        if ($type->isEnum()) {
-            return 4;
+        $this->typeSizeDepth++;
+        try {
+            if ($type->isArrayType()) {
+                $elemSize = $this->resolveTypeSize($type->arrayElementType);
+                return $type->arraySizeValue !== null ? $elemSize * $type->arraySizeValue : 0;
+            }
+            $builtIn = ['int', 'char', 'bool', 'long', 'short', 'float', 'double', 'void'];
+            if (in_array($type->baseName, $builtIn, true)) {
+                return $type->sizeInBytes();
+            }
+            if ($type->isEnum()) {
+                return 4;
+            }
+            $name = $type->className ?? $type->baseName;
+            $classSym = $this->symbolTable->lookupClass($name);
+            if ($classSym !== null && $classSym->size > 0) {
+                return $classSym->size;
+            }
+            $tdSym = $this->symbolTable->lookupTypedef($name);
+            if ($tdSym !== null) {
+                return $this->resolveTypeSize($tdSym->targetType);
+            }
+            return $type->sizeInBytes();
+        } finally {
+            $this->typeSizeDepth--;
         }
-        $name = $type->className ?? $type->baseName;
-        $classSym = $this->symbolTable->lookupClass($name);
-        if ($classSym !== null && $classSym->size > 0) {
-            return $classSym->size;
-        }
-        $tdSym = $this->symbolTable->lookupTypedef($name);
-        if ($tdSym !== null) {
-            return $this->resolveTypeSize($tdSym->targetType);
-        }
-        return $type->sizeInBytes();
     }
 
     private function collectEnum(EnumDeclaration $decl): void
@@ -703,6 +719,10 @@ class Analyzer
     {
         if ($decl instanceof FunctionDeclaration) {
             $this->analyzeFunction($decl);
+        } elseif ($decl instanceof BlockStatement) {
+            foreach ($decl->statements as $inner) {
+                $this->typeCheckTopLevel($inner);
+            }
         } elseif ($decl instanceof ClassDeclaration) {
             $this->analyzeClass($decl);
         } elseif ($decl instanceof EnumDeclaration) {

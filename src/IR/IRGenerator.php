@@ -80,6 +80,9 @@ class IRGenerator
     /** @var array<string, string> static local name => mangled global name */
     private array $staticLocalMap = [];
 
+    /** @var array<string, int> counter for deduplicating static local mangled names */
+    private array $staticLocalCounter = [];
+
     /** Current class name when generating a method, null otherwise */
     private ?string $currentClassName = null;
 
@@ -156,13 +159,14 @@ class IRGenerator
         $prevPendingGotos  = $this->pendingGotos;
         $prevClassName     = $this->currentClassName;
 
-        $this->currentFunction = $irFunc;
+        $this->currentFunction  = $irFunc;
         $this->currentClassName = $node->className;
-        $this->varMap          = [];
-        $this->arrayVars       = [];
-        $this->staticLocalMap  = [];
-        $this->namedLabels     = [];
-        $this->pendingGotos    = [];
+        $this->varMap           = [];
+        $this->arrayVars        = [];
+        $this->staticLocalMap   = [];
+        $this->staticLocalCounter = [];
+        $this->namedLabels      = [];
+        $this->pendingGotos     = [];
 
         // Use mangled name to avoid duplicate 'entry' labels across functions.
         $entryBlock = $irFunc->createBlock('.L' . $mangledName . '_entry');
@@ -706,7 +710,10 @@ class IRGenerator
 
         // Static local variables are stored as globals with a mangled name.
         if ($node->type->isStatic) {
-            $mangledName = $this->currentFunction->name . '.' . $node->name;
+            $baseMangled = $this->currentFunction->name . '.' . $node->name;
+            $counter = ($this->staticLocalCounter[$baseMangled] ?? 0);
+            $this->staticLocalCounter[$baseMangled] = $counter + 1;
+            $mangledName = $counter === 0 ? $baseMangled : $baseMangled . '.' . $counter;
             $elemSize = $this->getTypeSize($node->type);
             $totalSize = $elemSize;
             $initValue = null;

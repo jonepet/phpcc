@@ -196,7 +196,10 @@ class AsmEmitter
     {
         $srcSize = self::regOperandSize($src);
         $dstSize = self::regOperandSize($dst);
-        if ($srcSize === 4 && $dstSize === 8) {
+        if ($srcSize >= $dstSize) {
+            // Same size or truncation — plain move, no sign-extend needed.
+            $this->emit('movq', $src, $dst);
+        } elseif ($srcSize === 4 && $dstSize === 8) {
             $this->emit('movslq', $src, $dst);
         } else {
             $mn = 'movs' . self::sizeSuffix($srcSize) . self::sizeSuffix($dstSize);
@@ -208,7 +211,10 @@ class AsmEmitter
     {
         $srcSize = self::regOperandSize($src);
         $dstSize = self::regOperandSize($dst);
-        if ($srcSize === 4 && $dstSize === 8) {
+        if ($srcSize >= $dstSize) {
+            // Same size or truncation — plain move, no zero-extend needed.
+            $this->emit('movq', $src, $dst);
+        } elseif ($srcSize === 4 && $dstSize === 8) {
             // Zero-extending 32→64 is automatic in x86-64: use movl to 32-bit sub-register
             $dst32 = '%' . self::reg32(ltrim($dst, '%'));
             $this->emit('movl', $src, $dst32);

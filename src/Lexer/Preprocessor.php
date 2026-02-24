@@ -130,6 +130,10 @@ class Preprocessor
             '/usr/include',
             '/usr/local/include',
         ];
+        // GCC internal headers (float.h, stdarg.h, stddef.h, etc.)
+        foreach (glob('/usr/lib/gcc/x86_64-linux-gnu/*/include') as $gccPath) {
+            $systemPaths[] = $gccPath;
+        }
         $this->systemIncludePaths = array_merge(
             $this->userIncludePaths,
             $this->cppMode ? [...$stubPaths, ...$systemPaths] : [...$systemPaths, ...$stubPaths],
@@ -334,11 +338,11 @@ class Preprocessor
         $prevLine = $this->currentLine;
         $this->currentFile = $file;
 
-        // Strip comments first
-        $source = $this->stripComments($source);
-
-        // Handle line continuations (backslash-newline)
+        // Per the C standard: phase 2 (line splicing) before phase 3 (comment removal).
+        // Backslash-newline joining must happen first so that multi-line #define
+        // bodies containing comments are correctly joined before comments are stripped.
         $source = $this->joinContinuationLines($source);
+        $source = $this->stripComments($source);
 
         $lines = $this->splitLines($source);
         $output = [];
