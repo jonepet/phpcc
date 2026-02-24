@@ -347,6 +347,9 @@ class Preprocessor
         $lines = $this->splitLines($source);
         $output = [];
 
+        // Emit line directive at start of file so the lexer knows the source location.
+        $output[] = "# 1 \"{$file}\"";
+
         // Conditional compilation stack
         // Each frame: ['active' => bool, 'seen_else' => bool, 'done' => bool, 'parent_emitting' => bool]
         $condStack = [];
@@ -547,23 +550,29 @@ class Preprocessor
                     $output[] = '';
                     break;
 
+                case 'include_next':
                 case 'include':
                     $firstDirectiveSeen = true;
                     if (!$emitting) {
                         $output[] = '';
                         break;
                     }
-                    // Expand macros in the #include argument (for computed includes)
-                    $expandedRest = $this->expandMacros($rest);
-                    $included = $this->processInclude($expandedRest, $file, $lineNum, $sourceDir);
+                    // Only expand macros for computed includes (bare identifier).
+                    // For #include <...> and #include "...", the path is literal —
+                    // macro expansion would corrupt names like errno.h.
+                    $trimmedRest = ltrim($rest);
+                    if (!str_starts_with($trimmedRest, '<') && !str_starts_with($trimmedRest, '"')) {
+                        $trimmedRest = $this->expandMacros($rest);
+                    }
+                    $includeNext = ($directive === 'include_next');
+                    $included = $this->processInclude($trimmedRest, $file, $lineNum, $sourceDir, $includeNext);
                     $includedLines = $this->splitLines($included);
                     foreach ($includedLines as $il) {
                         $output[] = $il;
                     }
-                    // Don't add an extra blank line if include already added content
-                    if (empty($includedLines) || (count($includedLines) === 1 && $includedLines[0] === '')) {
-                        $output[] = '';
-                    }
+                    // Restore line/file context after returning from include.
+                    $nextLine = $lineNum + 1;
+                    $output[] = "# {$nextLine} \"{$file}\"";
                     break;
 
                 case 'define':
@@ -708,12 +717,9 @@ class Preprocessor
                             $i += 2;
                             break;
                         }
-                        if ($source[$i] === "\n") {
-                            $result .= "\n"; // preserve newlines for line counting
-                        }
                         $i++;
                     }
-                    $result .= ' '; // replace comment with single space
+                    $result .= ' '; // replace entire comment with single space (C standard)
                     continue;
                 }
             }
@@ -776,6 +782,7 @@ class Preprocessor
         string $parentFile,
         int    $lineNum,
         string $sourceDir,
+        bool   $includeNext = false,
     ): string {
         $rest = trim($rest);
 
@@ -826,7 +833,7 @@ class Preprocessor
         // Build candidate list
         $candidates = [];
 
-        if (!$isSystem) {
+        if (!$isSystem && !$includeNext) {
             // For "..." includes, search relative to including file first, then sourceDir
             $parentDir = $parentFile !== '' ? dirname($parentFile) : $sourceDir;
             if ($parentDir !== '') {
@@ -838,7 +845,16 @@ class Preprocessor
         }
 
         // System paths (always searched for <> includes, and as fallback for "" includes)
+        // For #include_next, skip paths up to and including the directory of the current file.
+        $parentDir = $parentFile !== '' ? dirname($parentFile) : '';
+        $pastCurrent = !$includeNext;
         foreach ($this->systemIncludePaths as $sysPath) {
+            if (!$pastCurrent) {
+                if ($parentDir !== '' && realpath($sysPath) === realpath($parentDir)) {
+                    $pastCurrent = true;
+                }
+                continue;
+            }
             $candidates[] = $sysPath . '/' . $includePath;
         }
 
@@ -1314,6 +1330,9 @@ class Preprocessor
      * Evaluate a preprocessor #if / #elif condition expression.
      * Returns the integer value (0 = false, non-zero = true).
      */
+    /** Whether the current #if expression contains unsigned literals. */
+    private bool $exprHasUnsigned = false;
+
     private function evaluateConditionExpression(string $expr, string $file, int $lineNum): int
     {
         // First expand macros (but handle 'defined' specially)
@@ -1324,6 +1343,14 @@ class Preprocessor
 
         // Parse and evaluate the expression
         $tokens = $this->tokenizeExpression($expr);
+        // Detect unsigned literals (U suffix) — enables unsigned comparison.
+        $this->exprHasUnsigned = false;
+        foreach ($tokens as $tok) {
+            if (($tok['unsigned'] ?? false) === true) {
+                $this->exprHasUnsigned = true;
+                break;
+            }
+        }
         $pos = 0;
         $result = $this->parseExprTernary($tokens, $pos, $file, $lineNum);
         return $result;
@@ -1646,12 +1673,16 @@ class Preprocessor
                     }
                 }
                 // Skip suffixes: u, U, l, L, ll, LL, etc.
+                $hasU = false;
                 while ($pos < $len && ($expr[$pos] === 'u' || $expr[$pos] === 'U' ||
                        $expr[$pos] === 'l' || $expr[$pos] === 'L')) {
+                    if ($expr[$pos] === 'u' || $expr[$pos] === 'U') {
+                        $hasU = true;
+                    }
                     $pos++;
                 }
                 $numStr = substr($expr, $start, $pos - $start);
-                $tokens[] = ['type' => 'num', 'value' => $this->parseNumber($numStr)];
+                $tokens[] = ['type' => 'num', 'value' => $this->parseNumber($numStr), 'unsigned' => $hasU];
                 continue;
             }
 
@@ -1718,6 +1749,13 @@ class Preprocessor
         }
 
         if (str_starts_with($numStr, '0x') || str_starts_with($numStr, '0X')) {
+            $hex = substr($numStr, 2);
+            // For values that exceed PHP_INT_MAX, interpret as two's complement.
+            if (strlen($hex) >= 16) {
+                $high = (int) hexdec(substr($hex, 0, -8)) & 0xFFFFFFFF;
+                $low  = (int) hexdec(substr($hex, -8)) & 0xFFFFFFFF;
+                return ($high << 32) | $low;
+            }
             return intval($numStr, 16);
         }
         if (str_starts_with($numStr, '0b') || str_starts_with($numStr, '0B')) {
@@ -1726,7 +1764,86 @@ class Preprocessor
         if ($numStr[0] === '0') {
             return intval($numStr, 8);
         }
-        return intval($numStr, 10);
+        // For decimal values that exceed PHP_INT_MAX, convert via hex.
+        $val = intval($numStr, 10);
+        if ($val === PHP_INT_MAX && $numStr !== (string) PHP_INT_MAX) {
+            return $this->decimalStringToInt64($numStr);
+        }
+        return $val;
+    }
+
+    /**
+     * Convert a large decimal string to a signed 64-bit int (two's complement).
+     */
+    private function decimalStringToInt64(string $s): int
+    {
+        // Convert to hex via repeated string-based division by 16.
+        $hex = '';
+        while ($s !== '0' && $s !== '') {
+            $remainder = 0;
+            $quotient = '';
+            for ($i = 0, $len = strlen($s); $i < $len; $i++) {
+                $digit = $remainder * 10 + ($s[$i] - '0');
+                $q = intdiv($digit, 16);
+                $remainder = $digit % 16;
+                if ($quotient !== '' || $q !== 0) {
+                    $quotient .= $q;
+                }
+            }
+            $hex = dechex($remainder) . $hex;
+            $s = $quotient ?: '0';
+        }
+        // Interpret as two's complement signed 64-bit.
+        if (strlen($hex) >= 16) {
+            $high = (int) hexdec(substr($hex, 0, -8)) & 0xFFFFFFFF;
+            $low  = (int) hexdec(substr($hex, -8)) & 0xFFFFFFFF;
+            return ($high << 32) | $low;
+        }
+        return (int) hexdec($hex);
+    }
+
+    /**
+     * 64-bit wrapping addition (two's complement).
+     */
+    private function wrappingAdd(int $a, int $b): int
+    {
+        $sum = $a + $b;
+        if (is_int($sum)) {
+            return $sum;
+        }
+        // Overflow: split into 32-bit halves.
+        $aLo = $a & 0xFFFFFFFF;
+        $aHi = ($a >> 32) & 0xFFFFFFFF;
+        $bLo = $b & 0xFFFFFFFF;
+        $bHi = ($b >> 32) & 0xFFFFFFFF;
+        $lo = $aLo + $bLo;
+        $carry = ($lo >> 32) & 1;
+        $lo &= 0xFFFFFFFF;
+        $hi = ($aHi + $bHi + $carry) & 0xFFFFFFFF;
+        return ($hi << 32) | $lo;
+    }
+
+    /**
+     * 64-bit wrapping multiplication (two's complement).
+     */
+    private function wrappingMultiply(int $a, int $b): int
+    {
+        $result = $a * $b;
+        if (is_int($result)) {
+            return $result;
+        }
+        // Overflow: binary multiplication with shift-and-add.
+        $result = 0;
+        $neg = ($b < 0);
+        $b = $neg ? (~$b + 1) : $b;  // abs via two's complement (safe for most values)
+        for ($i = 0; $i < 64 && $b > 0; $i++) {
+            if ($b & 1) {
+                $result = $this->wrappingAdd($result, $a);
+            }
+            $a <<= 1;
+            $b >>= 1;
+        }
+        return $neg ? -$result : $result;
     }
 
     // ── Expression Parsing (recursive descent) ─────────────────────────
@@ -1843,12 +1960,24 @@ class Preprocessor
             $op = $tokens[$pos]['value'];
             $pos++;
             $right = $this->parseExprShift($tokens, $pos, $file, $line);
-            $left = match ($op) {
-                '<' => ($left < $right) ? 1 : 0,
-                '>' => ($left > $right) ? 1 : 0,
-                '<=' => ($left <= $right) ? 1 : 0,
-                '>=' => ($left >= $right) ? 1 : 0,
-            };
+            if ($this->exprHasUnsigned) {
+                // Unsigned comparison via sign-bit flip (maps signed to unsigned order).
+                $ul = $left ^ PHP_INT_MIN;
+                $ur = $right ^ PHP_INT_MIN;
+                $left = match ($op) {
+                    '<' => ($ul < $ur) ? 1 : 0,
+                    '>' => ($ul > $ur) ? 1 : 0,
+                    '<=' => ($ul <= $ur) ? 1 : 0,
+                    '>=' => ($ul >= $ur) ? 1 : 0,
+                };
+            } else {
+                $left = match ($op) {
+                    '<' => ($left < $right) ? 1 : 0,
+                    '>' => ($left > $right) ? 1 : 0,
+                    '<=' => ($left <= $right) ? 1 : 0,
+                    '>=' => ($left >= $right) ? 1 : 0,
+                };
+            }
         }
 
         return $left;
@@ -1880,8 +2009,8 @@ class Preprocessor
             $pos++;
             $right = $this->parseExprMultiplicative($tokens, $pos, $file, $line);
             $left = match ($op) {
-                '+' => $left + $right,
-                '-' => $left - $right,
+                '+' => $this->wrappingAdd($left, $right),
+                '-' => $this->wrappingAdd($left, -$right),
             };
         }
 
@@ -1898,7 +2027,7 @@ class Preprocessor
             $pos++;
             $right = $this->parseExprUnary($tokens, $pos, $file, $line);
             $left = match ($op) {
-                '*' => $left * $right,
+                '*' => $this->wrappingMultiply($left, $right),
                 '/' => $right !== 0 ? intdiv($left, $right) : 0,
                 '%' => $right !== 0 ? $left % $right : 0,
             };

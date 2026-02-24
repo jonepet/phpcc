@@ -1265,6 +1265,29 @@ final class Parser
         $this->expect(TokenType::LeftBrace);
         $members = $this->parseClassBody($isStruct);
         $this->expect(TokenType::RightBrace);
+
+        // Handle `struct/union { ... } varname, *ptr;` — variable declaration after body.
+        // Skip any trailing qualifiers or pointers, then variable name(s), before `;`.
+        while ($this->check(TokenType::Identifier) || $this->check(TokenType::Star)
+            || $this->check(TokenType::Const) || $this->check(TokenType::Volatile)) {
+            if ($this->check(TokenType::Identifier)) {
+                $this->advance(); // consume variable name
+                // Array declarator: `var[N]`
+                while ($this->check(TokenType::LeftBracket)) {
+                    $this->advance();
+                    if (!$this->check(TokenType::RightBracket)) {
+                        $this->parseExpression();
+                    }
+                    $this->expect(TokenType::RightBracket);
+                }
+                if ($this->check(TokenType::Comma)) {
+                    $this->advance(); // consume ','
+                    continue;
+                }
+                break;
+            }
+            $this->advance(); // consume *, const, volatile
+        }
         $this->expect(TokenType::Semicolon);
 
         return (new ClassDeclaration(
@@ -2578,6 +2601,14 @@ final class Parser
         }
 
         if ($cur->type === TokenType::Identifier && isset($this->typeNames[$cur->value])) {
+            // In C, a name can be both a struct tag and a function
+            // (e.g., `stat` is `struct stat` and also `stat()`).
+            // If the type name is immediately followed by `(`, it's a
+            // function call inside grouping parens, not a cast.
+            $next = $this->peek(1);
+            if ($next !== null && $next->type === TokenType::LeftParen) {
+                return false;
+            }
             return true;
         }
 

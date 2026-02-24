@@ -46,6 +46,20 @@ class Lexer
             return;
         }
 
+        // Line directive: `# linenum "filename"` emitted by the preprocessor.
+        // Must appear at the start of a line (column 1).
+        if ($ch === '#' && $startCol === 1) {
+            // Peek past whitespace to check for a digit (line number).
+            $peekPos = $this->pos;
+            while ($peekPos < $this->len && ($this->source[$peekPos] === ' ' || $this->source[$peekPos] === "\t")) {
+                $peekPos++;
+            }
+            if ($peekPos < $this->len && $this->isDigit($this->source[$peekPos])) {
+                $this->parseLineDirective();
+                return;
+            }
+        }
+
         if ($ch === '/' && $this->peek() === '/') {
             $this->advance();
             while ($this->pos < $this->len && $this->current() !== "\n") {
@@ -90,6 +104,62 @@ class Lexer
         }
 
         $this->scanOperator($ch, $startLine, $startCol);
+    }
+
+    /**
+     * Parse a preprocessor line directive: `# linenum "filename"`
+     * Updates the lexer's line/file tracking for subsequent tokens.
+     */
+    private function parseLineDirective(): void
+    {
+        // Skip whitespace between `#` and the line number
+        while ($this->pos < $this->len && ($this->current() === ' ' || $this->current() === "\t")) {
+            $this->advance();
+        }
+
+        // Read the line number
+        $num = '';
+        while ($this->pos < $this->len && $this->isDigit($this->current())) {
+            $num .= $this->advance();
+        }
+
+        if ($num === '') {
+            // Not a valid line directive; skip to end of line
+            while ($this->pos < $this->len && $this->current() !== "\n") {
+                $this->advance();
+            }
+            return;
+        }
+
+        $newLine = (int) $num;
+
+        // Skip whitespace before optional filename
+        while ($this->pos < $this->len && ($this->current() === ' ' || $this->current() === "\t")) {
+            $this->advance();
+        }
+
+        // Read optional filename: "filename"
+        if ($this->pos < $this->len && $this->current() === '"') {
+            $this->advance(); // consume opening quote
+            $filename = '';
+            while ($this->pos < $this->len && $this->current() !== '"' && $this->current() !== "\n") {
+                $filename .= $this->advance();
+            }
+            if ($this->pos < $this->len && $this->current() === '"') {
+                $this->advance(); // consume closing quote
+            }
+            $this->file = $filename;
+        }
+
+        // Skip rest of line (flags, etc.)
+        while ($this->pos < $this->len && $this->current() !== "\n") {
+            $this->advance();
+        }
+
+        // The `\n` at end of this directive line will be consumed by the main
+        // loop's advance(), incrementing line by 1.  Set line to newLine - 1
+        // so the NEXT source line is reported as $newLine.
+        $this->line = $newLine - 1;
     }
 
     private function scanString(int $startLine, int $startCol): void
