@@ -663,6 +663,17 @@ class ElfWriter
             $dynSymEntries[] = $this->symEntry($nameOff, $stInfo, 0, 0, 0);
         }
 
+        // Data-section reloc symbols not already in PLT (data-only external refs)
+        foreach ($gotPlt->getDataSectionRelocs() as $reloc) {
+            $name = $reloc['symName'];
+            if (isset($dynSymIndex[$name])) continue;
+            $nameOff = strlen($dynstr);
+            $dynstr .= $name . "\0";
+            $stInfo = (1 << 4) | 0; // STB_GLOBAL | STT_NOTYPE
+            $dynSymIndex[$name] = count($dynSymEntries);
+            $dynSymEntries[] = $this->symEntry($nameOff, $stInfo, 0, 0, 0);
+        }
+
         // Build symbol → section/offset map from section data
         $symbolMap = []; // name → ['section' => string, 'offset' => int, 'type' => string]
         foreach ($sections as $sec) {
@@ -818,6 +829,10 @@ class ElfWriter
         $relaPltBytes = $gotPlt->buildRelaPlt($gotPltVAddr, $dynSymIndex);
         $pltBytes = $gotPlt->buildPlt($pltVAddr, $gotPltVAddr);
         $gotPltBytes = $gotPlt->buildGotPlt($pltVAddr, $dynamicVAddr);
+
+        // Rebuild .rela.dyn with correct section VAddrs so data-section GLOB_DAT entries
+        // point to the right runtime slots (the initial build at line 723 used VAddr=0 for sizing).
+        $relaDynBytes = $gotPlt->buildRelaDyn(0, $dynSymIndex, $secVAddrs);
 
         // Shstrtab
         $shstrtab = "\0";

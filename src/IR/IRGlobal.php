@@ -13,5 +13,7 @@ class IRGlobal
         public readonly ?string $initValue = null,
         public readonly ?string $stringData = null,
         public readonly bool $isLocal = false,
+        /** @var string[]|null  symbol/int values for struct/array .data emission */
+        public readonly ?array $initElements = null,
     ) {}
 }

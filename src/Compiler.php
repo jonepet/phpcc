@@ -453,6 +453,24 @@ class Compiler
             $linker->extendBss($newBssSize);
         }
 
+        // For shared libraries: scan .data for ABS64 relocs targeting dynamic symbols.
+        // These need R_X86_64_GLOB_DAT entries in .rela.dyn so the dynamic linker can
+        // fill in the correct runtime address (e.g. function pointers in static struct inits).
+        if ($buildShared) {
+            $dynamicSet = [];
+            foreach ($gotPlt->getPltSymbols() as $s) {
+                $dynamicSet[$s] = true;
+            }
+            $dataSec = $allSections['.data'] ?? null;
+            if ($dataSec !== null) {
+                foreach ($dataSec->relocs as $reloc) {
+                    if ($reloc->type === 'ABS64' && isset($dynamicSet[$reloc->target])) {
+                        $gotPlt->addDataSectionReloc('.data', $reloc->offset, $reloc->target);
+                    }
+                }
+            }
+        }
+
         // Compute layout with exact segment sizes
         $layout = ElfWriter::computeDynLayout($linker, $gotPlt, $neededLibs);
 
@@ -479,7 +497,7 @@ class Compiler
         }
 
         // Resolve relocations (local symbols + PLT + GOT redirects)
-        $linker->resolve($layout['vaddrs'], $pltAddrs, $gotAddrs);
+        $linker->resolve($layout['vaddrs'], $pltAddrs, $gotAddrs, $buildShared);
 
         // Build final ELF
         $elfWriter = new ElfWriter();

@@ -49,6 +49,16 @@ class GotPltBuilder
     private array $copyBssOffsets = [];
 
     /**
+     * Direct ABS64 data-section references to external symbols.
+     * Each entry: ['section' => string, 'offset' => int, 'symName' => string].
+     * These become R_X86_64_GLOB_DAT entries in .rela.dyn — the dynamic linker
+     * writes the resolved symbol address into the data slot at load time.
+     *
+     * @var array<array{section: string, offset: int, symName: string}>
+     */
+    private array $dataSectionRelocs = [];
+
+    /**
      * Add a function symbol that needs a PLT entry.
      */
     public function addPltSymbol(string $name): void
@@ -57,6 +67,28 @@ class GotPltBuilder
             $this->pltIndex[$name] = count($this->pltSymbols);
             $this->pltSymbols[] = $name;
         }
+    }
+
+    /**
+     * Add a direct data-section reference to an external symbol.
+     * The slot at $sectionOffset within $section needs an R_X86_64_GLOB_DAT
+     * dynamic relocation so the dynamic linker fills in the symbol's address.
+     */
+    public function addDataSectionReloc(string $section, int $sectionOffset, string $symName): void
+    {
+        $this->dataSectionRelocs[] = [
+            'section' => $section,
+            'offset'  => $sectionOffset,
+            'symName' => $symName,
+        ];
+    }
+
+    /**
+     * @return array<array{section: string, offset: int, symName: string}>
+     */
+    public function getDataSectionRelocs(): array
+    {
+        return $this->dataSectionRelocs;
     }
 
     /**
@@ -264,12 +296,15 @@ class GotPltBuilder
      * Build .rela.dyn entries (R_X86_64_GLOB_DAT).
      * Only emits entries for undefined symbols (not pre-filled).
      *
-     * @param int $gotVAddr  Virtual address of .got
+     * @param int $gotVAddr  Virtual address of .got (for GOTPCREL GOT entries)
      * @param array<string, int> $dynSymIndex  symbol name → index in .dynsym
+     * @param array<string, int> $sectionVAddrs  section name → virtual address (for dataSectionRelocs)
      */
-    public function buildRelaDyn(int $gotVAddr, array $dynSymIndex): string
+    public function buildRelaDyn(int $gotVAddr, array $dynSymIndex, array $sectionVAddrs = []): string
     {
         $bytes = '';
+
+        // GOT entries for GOTPCREL data symbols
         foreach ($this->gotDataSymbols as $idx => $name) {
             // Skip locally-defined symbols — their GOT entries are pre-filled
             if (isset($this->gotEntryValues[$name])) {
@@ -284,6 +319,19 @@ class GotPltBuilder
             $bytes .= pack('P', $rInfo);         // r_info
             $bytes .= pack('P', 0);              // r_addend
         }
+
+        // Direct data-section references (e.g. struct {fn_ptr} = {malloc}).
+        // The dynamic linker fills the slot with the actual symbol address.
+        foreach ($this->dataSectionRelocs as $reloc) {
+            $slotVAddr = ($sectionVAddrs[$reloc['section']] ?? 0) + $reloc['offset'];
+            $symIdx = $dynSymIndex[$reloc['symName']] ?? 0;
+            $rInfo = ($symIdx << 32) | 6; // R_X86_64_GLOB_DAT = 6
+
+            $bytes .= pack('P', $slotVAddr); // r_offset
+            $bytes .= pack('P', $rInfo);     // r_info
+            $bytes .= pack('P', 0);          // r_addend
+        }
+
         return $bytes;
     }
 

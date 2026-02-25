@@ -297,14 +297,54 @@ class IRGenerator
             // String literal → store as a pointer to a .rodata label.
             $label = $this->module->addString($node->initializer->value);
             $initValue = $label;
+        } elseif ($node->initializer instanceof IdentifierExpr) {
+            // Function name or global variable used as address initializer.
+            // Emit .quad symname in .data so as/ld creates R_X86_64_64/RELATIVE reloc.
+            $sym = $this->analyzer->getSymbolTable()->lookup($node->initializer->name);
+            // Enum constants must fold to integer values, not symbol references.
+            if ($sym !== null && $sym->kind === \Cppc\Semantic\SymbolKind::EnumValue) {
+                $initValue = (string)($sym->enumValue ?? 0);
+            } elseif ($sym instanceof FunctionSymbol && $sym->mangledName !== '') {
+                $initValue = $sym->mangledName;
+            } elseif ($sym !== null) {
+                $initValue = $node->initializer->name;
+            }
         }
 
         $isLocal = $node->type->isStatic;
+
+        // Struct/array initializer list: try to extract compile-time constant elements.
+        // If all elements are constants, emit as .data with .quad entries (proper PIC,
+        // no runtime init needed — avoids .init_array ordering issues).
+        if ($node->arrayInit !== null) {
+            $elements = [];
+            $allConst = true;
+            foreach ($node->arrayInit->values as $val) {
+                $inner = $val instanceof DesignatedInit ? $val->value : $val;
+                $elem  = $this->tryEvalGlobalInitElement($inner);
+                if ($elem === null) {
+                    $allConst = false;
+                    break;
+                }
+                $elements[] = $elem;
+            }
+            if ($allConst && $elements !== []) {
+                $this->module->addGlobal($node->name, $typeStr, $size, '', isLocal: $isLocal, initElements: $elements);
+                $this->globalVars[$node->name] = true;
+                return;
+            }
+        }
+
         $this->module->addGlobal($node->name, $typeStr, $size, $initValue, isLocal: $isLocal);
         $this->globalVars[$node->name] = true;
 
-        // Non-constant initializer: generate an __init function to run at module load.
-        if ($node->initializer !== null && $initValue === null) {
+        // Non-constant initializer: generate an __init function registered in .init_array
+        // to run at module load (handles complex expressions that can't be folded at compile time).
+        $runtimeInit = ($node->initializer !== null && $initValue === null)
+                    ? $node->initializer
+                    : ($node->arrayInit !== null ? $node->arrayInit : null);
+
+        if ($runtimeInit !== null) {
             $initFunc = new IRFunction('__init_' . $node->name, 'void', 0, false);
             $this->module->addFunction($initFunc);
 
@@ -319,7 +359,7 @@ class IRGenerator
             $block = $initFunc->createBlock('.L__init_' . $node->name . '_entry');
             $this->switchBlock($block);
 
-            $val = $this->generateExpression($node->initializer);
+            $val = $this->generateExpression($runtimeInit);
             $this->emit(new Instruction(OpCode::StoreGlobal, Operand::global($node->name), $val));
             $this->emit(new Instruction(OpCode::Return_));
 
@@ -749,6 +789,16 @@ class IRGenerator
             } elseif ($node->initializer instanceof StringLiteralNode) {
                 $label = $this->module->addString($node->initializer->value);
                 $initValue = $label;
+            } elseif ($node->initializer instanceof IdentifierExpr) {
+                $sym = $this->analyzer->getSymbolTable()->lookup($node->initializer->name);
+                // Enum constants must fold to integer values, not symbol references.
+                if ($sym !== null && $sym->kind === \Cppc\Semantic\SymbolKind::EnumValue) {
+                    $initValue = (string)($sym->enumValue ?? 0);
+                } elseif ($sym instanceof FunctionSymbol && $sym->mangledName !== '') {
+                    $initValue = $sym->mangledName;
+                } elseif ($sym !== null) {
+                    $initValue = $node->initializer->name;
+                }
             }
 
             $this->module->addGlobal($mangledName, (string)$node->type, $totalSize, $initValue, $stringData, isLocal: true);
@@ -2284,10 +2334,74 @@ class IRGenerator
         }
     }
 
+    /**
+     * Try to evaluate a global initializer element as a compile-time constant string.
+     * Returns the string representation (a decimal integer or a symbol name) or null
+     * if the expression is not a compile-time constant.
+     *
+     * Used to fold struct/array InitializerList elements into .data .quad entries,
+     * so the linker/dynamic-linker can create R_X86_64_64/RELATIVE relocations for
+     * function-pointer fields rather than leaving them zeroed in .bss.
+     */
+    private function tryEvalGlobalInitElement(?Node $expr): ?string
+    {
+        if ($expr === null) {
+            return null;
+        }
+        if ($expr instanceof IntLiteral) {
+            return (string)$expr->value;
+        }
+        if ($expr instanceof BoolLiteral) {
+            return $expr->value ? '1' : '0';
+        }
+        if ($expr instanceof CharLiteralNode) {
+            return (string)$expr->ordValue;
+        }
+        if ($expr instanceof NullptrLiteral) {
+            return '0';
+        }
+        if ($expr instanceof FloatLiteral) {
+            // Float stored as raw bits in a .quad is unusual; just return the value string.
+            return (string)$expr->value;
+        }
+        if ($expr instanceof CastExpr) {
+            // Peels casts like (AcquireMemoryHandler) malloc — the symbol name is all we need.
+            return $this->tryEvalGlobalInitElement($expr->expression);
+        }
+        if ($expr instanceof UnaryExpr && $expr->operator === '&') {
+            // Address-of: just treat inner operand as a symbol.
+            return $this->tryEvalGlobalInitElement($expr->operand);
+        }
+        if ($expr instanceof IdentifierExpr) {
+            $sym = $this->analyzer->getSymbolTable()->lookup($expr->name);
+            // Enum constants must fold to their integer values, not become symbol references.
+            if ($sym !== null && $sym->kind === \Cppc\Semantic\SymbolKind::EnumValue) {
+                return (string)($sym->enumValue ?? 0);
+            }
+            if ($sym instanceof FunctionSymbol && $sym->mangledName !== '') {
+                return $sym->mangledName;
+            }
+            // Unknown or external symbol (e.g., libc malloc) — use the name as-is.
+            // The assembler will create the appropriate relocation.
+            return $expr->name;
+        }
+        // Nested initializer list → not supported here; fall through to runtime init.
+        return null;
+    }
+
     private function tryEvalConstant(Node $expr): ?int
     {
         if ($expr instanceof IntLiteral) {
             return $expr->value;
+        }
+        if ($expr instanceof BoolLiteral) {
+            return $expr->value ? 1 : 0;
+        }
+        if ($expr instanceof IdentifierExpr) {
+            $sym = $this->analyzer->getSymbolTable()->lookup($expr->name);
+            if ($sym !== null && $sym->kind === \Cppc\Semantic\SymbolKind::EnumValue) {
+                return $sym->enumValue ?? 0;
+            }
         }
         if ($expr instanceof BinaryExpr) {
             $l = $this->tryEvalConstant($expr->left);

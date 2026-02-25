@@ -84,7 +84,7 @@ class X86Generator
         // ── .data ──────────────────────────────────────────────────────────
         $initGlobals = array_filter(
             $module->globals,
-            static fn(IRGlobal $g) => $g->initValue !== null,
+            static fn(IRGlobal $g) => $g->initValue !== null || $g->initElements !== null,
         );
         if ($initGlobals !== []) {
             $this->emitter->data();
@@ -104,7 +104,7 @@ class X86Generator
         // ── .bss ───────────────────────────────────────────────────────────
         $bssGlobals = array_filter(
             $module->globals,
-            static fn(IRGlobal $g) => $g->initValue === null,
+            static fn(IRGlobal $g) => $g->initValue === null && $g->initElements === null,
         );
         if ($bssGlobals !== []) {
             $this->emitter->bss();
@@ -152,6 +152,21 @@ class X86Generator
             $this->generateFunction($func);
         }
 
+        // ── .init_array — register __init_* functions for runtime execution ──
+        // Any global with a non-constant initializer gets an __init_name function.
+        // Register them in .init_array so the dynamic linker calls them before main.
+        $initFuncs = array_filter(
+            $module->functions,
+            static fn(IRFunction $f) => str_starts_with($f->name, '__init_'),
+        );
+        if ($initFuncs !== []) {
+            $this->emitter->emit('.section', '.init_array,"aw",@init_array');
+            $this->emitter->align(8);
+            foreach ($initFuncs as $f) {
+                $this->emitter->emit('.quad', $f->name);
+            }
+        }
+
         // ── .rodata — float constants (collected during .text pass) ────────
         if ($this->floatConsts !== []) {
             $this->emitter->rodata();
@@ -170,6 +185,21 @@ class X86Generator
 
     private function emitGlobalData(IRGlobal $global): void
     {
+        // Struct/array initializer list with compile-time constant elements.
+        // Each element emits a .quad (8 bytes). Zero-pad up to $global->size if needed.
+        if ($global->initElements !== null) {
+            $emitted = 0;
+            foreach ($global->initElements as $elem) {
+                $this->emitter->quad(is_numeric($elem) ? (int)$elem : $elem);
+                $emitted += 8;
+            }
+            $remaining = $global->size - $emitted;
+            if ($remaining > 0) {
+                $this->emitter->zero($remaining);
+            }
+            return;
+        }
+
         if ($global->stringData !== null) {
             $str = $global->stringData;
             $written = 0;
@@ -858,10 +888,11 @@ class X86Generator
 
         $destLoc = $this->resolveOperandLoc($inst->dest);
         $baseSrc = $this->operandToAsm($inst->src1);
-        // StackSlot and Param operands represent variable addresses on the stack.
+        // StackSlot, Param, and Global operands represent variable addresses.
         // We need lea (address-of) rather than mov (load value).
         $baseIsAddr = $inst->src1->kind === OperandKind::StackSlot
-            || $inst->src1->kind === OperandKind::Param;
+            || $inst->src1->kind === OperandKind::Param
+            || $inst->src1->kind === OperandKind::Global;
 
         // src2 holds the byte offset (may be a constant or vreg).
         $destReg = $this->ensureGPReg($destLoc, 'rax');
@@ -888,8 +919,17 @@ class X86Generator
                     $this->emitter->mem('rbp', $paramOff + $offset),
                     $this->emitter->reg($destReg),
                 );
+            } elseif ($inst->src1->kind === OperandKind::Global) {
+                // Global struct/array: get address of symbol then add member/element offset.
+                // lea global(%rip), %rcx; lea offset(%rcx), %destReg
+                $baseReg = 'rcx';
+                $this->emitter->lea($baseSrc, $this->emitter->reg($baseReg));
+                $this->emitter->lea(
+                    $this->emitter->mem($baseReg, $offset),
+                    $this->emitter->reg($destReg),
+                );
             } else {
-                // lea offset(%base), destReg
+                // VReg holding a pointer value: lea offset(%base), destReg
                 $baseReg = 'rcx';
                 if (!$this->isGPReg($baseSrc)) {
                     $this->emitter->mov($baseSrc, $this->emitter->reg($baseReg));

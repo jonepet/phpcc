@@ -167,8 +167,10 @@ class Linker
      * @param array<string, int> $sectionVAddrs section name → virtual address
      * @param array<string, int> $pltAddrs symbol name → PLT entry address (for dynamic calls)
      * @param array<string, int> $gotAddrs symbol name → GOT entry address (for data references)
+     * @param bool $isSharedLibrary When true, ABS64 relocs in .data for dynamic symbols are
+     *                              left unpatched (the dynamic linker will fill via GLOB_DAT).
      */
-    public function resolve(array $sectionVAddrs, array $pltAddrs = [], array $gotAddrs = []): void
+    public function resolve(array $sectionVAddrs, array $pltAddrs = [], array $gotAddrs = [], bool $isSharedLibrary = false): void
     {
         // Build symbol → virtual address map
         $symAddrs = [];
@@ -228,7 +230,14 @@ class Linker
                     $rel = ($targetAddr + $reloc->addend) - ($patchVAddr + 4);
                     $this->patchLE32($sec, $patchOffset, $rel);
                 } elseif ($reloc->type === 'ABS64') {
-                    $this->patchLE64($sec, $patchOffset, $targetAddr + $reloc->addend);
+                    // In a shared library (ET_DYN, PIC base=0), direct data-section references
+                    // to dynamic symbols must be filled by the dynamic linker via GLOB_DAT.
+                    // Patching with a PLT address here would embed a wrong compile-time address.
+                    if ($isSharedLibrary && $this->isDynamic($target) && $secName === '.data') {
+                        // Leave slot at 0; dynamic linker fills via .rela.dyn GLOB_DAT.
+                    } else {
+                        $this->patchLE64($sec, $patchOffset, $targetAddr + $reloc->addend);
+                    }
                 } elseif ($reloc->type === '32S') {
                     // Sign-extended 32-bit absolute
                     $this->patchLE32($sec, $patchOffset, ($targetAddr + $reloc->addend) & 0xFFFFFFFF);
