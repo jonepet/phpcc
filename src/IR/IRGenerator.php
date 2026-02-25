@@ -918,15 +918,20 @@ class IRGenerator
 
         $type = $this->analyzer->getExprType($node);
         $size = $this->getTypeSize($type);
+        $isFloat = $this->isFloatType($type);
 
         if ($addr->kind === OperandKind::Global) {
             $dest = $this->newVReg($size);
-            $this->emit(new Instruction(OpCode::LoadGlobal, $dest, $addr, line: $node->line));
+            $inst = new Instruction(OpCode::LoadGlobal, $dest, $addr, line: $node->line);
+            $inst->isFloatDef = $isFloat;
+            $this->emit($inst);
             return $dest;
         }
 
         $dest = $this->newVReg($size);
-        $this->emit(new Instruction(OpCode::Load, $dest, $addr, line: $node->line));
+        $inst = new Instruction(OpCode::Load, $dest, $addr, line: $node->line);
+        $inst->isFloatDef = $isFloat;
+        $this->emit($inst);
         return $dest;
     }
 
@@ -1017,6 +1022,20 @@ class IRGenerator
             $rightType = $rightType ?? $this->inferExpressionType($node->right);
             $isUnsigned = ($leftType !== null && $leftType->isUnsigned)
                        || ($rightType !== null && $rightType->isUnsigned);
+        }
+
+        // When emitting float operations, promote integer operands to float first.
+        if ($isFloat) {
+            if ($left->kind === OperandKind::Immediate) {
+                $conv = $this->newVReg();
+                $this->emit(new Instruction(OpCode::IntToFloat, $conv, $left, line: $node->line));
+                $left = $conv;
+            }
+            if ($right->kind === OperandKind::Immediate) {
+                $conv = $this->newVReg();
+                $this->emit(new Instruction(OpCode::IntToFloat, $conv, $right, line: $node->line));
+                $right = $conv;
+            }
         }
 
         $opcode = $this->binaryOpcode($node->operator, $isFloat, $isUnsigned);
@@ -1147,6 +1166,10 @@ class IRGenerator
                 $val  = $this->generateExpression($node->operand);
                 $dest = $this->newVReg();
                 $isFloat = $this->isFloatOperand($val);
+                if (!$isFloat) {
+                    $exprType = $this->inferExpressionType($node->operand);
+                    $isFloat = $this->isFloatType($exprType);
+                }
                 $opcode  = $isFloat ? OpCode::FNeg : OpCode::Neg;
                 $this->emit(new Instruction($opcode, $dest, $val, line: $node->line));
                 return $dest;
@@ -1670,6 +1693,10 @@ class IRGenerator
         $dest = $this->newVReg($this->getTypeSize($node->targetType));
 
         $srcIsFloat  = $this->isFloatOperand($src);
+        if (!$srcIsFloat) {
+            $srcType = $this->inferExpressionType($node->expression);
+            $srcIsFloat = $this->isFloatType($srcType);
+        }
         $destIsFloat = $this->isFloatType($node->targetType);
         $destIsPtr   = $node->targetType->isPointer();
 
@@ -2004,6 +2031,9 @@ class IRGenerator
             line: $line ?? 0,
         );
         $inst->isVariadicCall = $isVariadic;
+        if ($sym !== null) {
+            $inst->isFloatDef = $this->isFloatType($sym->returnType);
+        }
         $this->emit($inst);
         return $dest;
     }

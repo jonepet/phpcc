@@ -68,6 +68,8 @@ $depFile         = null;    // -MF file
 $genDeps         = false;   // -M / -MD / -MMD
 $extraLinkFlags  = [];      // -shared, -static, -fPIC passthrough
 $extraAsmFlags   = [];      // -fPIC passthrough to assembler
+$soname          = null;    // -Wl,-soname,NAME
+$buildShared     = false;   // -shared flag
 $strictUndeclared = false;  // -Werror=implicit-function-declaration
 
 // Auto-add host library paths (mounted to /host-libs/ to avoid conflicts with container libs).
@@ -153,14 +155,26 @@ for ($i = 0; $i < $argc; $i++) {
     }
 
     // ── -Wl,... linker flag passthrough ─────────────────────────────────
-    // Pass the entire -Wl,... flag through to gcc unchanged.
     if (str_starts_with($arg, '-Wl,')) {
         $linkerFlags[] = $arg;
+        // Extract -soname from -Wl,-soname,NAME or -Wl,-soname -Wl,NAME
+        $wlParts = explode(',', substr($arg, 4));
+        for ($wi = 0; $wi < count($wlParts); $wi++) {
+            if (($wlParts[$wi] === '-soname' || $wlParts[$wi] === '-h') && isset($wlParts[$wi + 1])) {
+                $soname = $wlParts[$wi + 1];
+                break;
+            }
+        }
         continue;
     }
 
     // ── Linker passthrough flags ────────────────────────────────────────
-    if ($arg === '-shared' || $arg === '-static') {
+    if ($arg === '-shared') {
+        $buildShared = true;
+        $extraLinkFlags[] = $arg;
+        continue;
+    }
+    if ($arg === '-static') {
         $extraLinkFlags[] = $arg;
         continue;
     }
@@ -224,11 +238,22 @@ if (empty($inputFiles)) {
 
 $sourceFiles = [];
 $objectFiles = [];
+$sharedLibFiles = []; // .so files passed directly as inputs
 
 foreach ($inputFiles as $f) {
     $ext = strtolower(pathinfo($f, PATHINFO_EXTENSION));
+    $base = basename($f);
     if ($ext === 'o' || $ext === 'obj') {
         $objectFiles[] = $f;
+    } elseif ($ext === 'a') {
+        // Static archives — treat as object files for linking
+        $objectFiles[] = $f;
+    } elseif (str_contains($base, '.so')) {
+        // Shared libraries (.so, .so.6, etc.) — resolve dynamic symbols only
+        $sharedLibFiles[] = $f;
+    } elseif ($ext === 'la') {
+        // Libtool archives — skip (libtool resolves these before calling us)
+        continue;
     } else {
         $sourceFiles[] = $f;
     }
@@ -258,16 +283,14 @@ if ($strictUndeclared) {
 foreach ($extraLinkFlags as $f) {
     $compiler->addLinkerFlag($f);
 }
-foreach ($extraAsmFlags as $f) {
-    $compiler->addAsmFlag($f);
-}
+// Assembler flags (e.g. -fPIC) are handled natively by the PHP assembler — no passthrough needed.
 
 // ── Link-only mode: all inputs are object files ──────────────────────────────
 
-if ($sourceFiles === [] && $objectFiles !== []) {
+if ($sourceFiles === [] && ($objectFiles !== [] || $sharedLibFiles !== [])) {
     $outPath = $outputFile ?? 'a.out';
     try {
-        $compiler->link($objectFiles, $outPath, $libraries, $libPaths);
+        $compiler->link($objectFiles, $outPath, $libraries, $libPaths, $sharedLibFiles, $buildShared, $soname);
     } catch (CompileError $e) {
         fwrite(STDERR, "c++: error: {$e->getMessage()}\n");
         exit(1);
@@ -324,7 +347,7 @@ if ($exitCode === 0 && $useSystemToolchain && !$compileOnly && !$emitAsm && !$pr
     }
 
     try {
-        $compiler->link($allObjects, $outPath, $libraries, $libPaths);
+        $compiler->link($allObjects, $outPath, $libraries, $libPaths, $sharedLibFiles, $buildShared, $soname);
     } catch (CompileError $e) {
         fwrite(STDERR, "c++: error: {$e->getMessage()}\n");
         $exitCode = 1;

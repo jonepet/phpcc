@@ -119,6 +119,10 @@ class RegisterAllocator
                     \Cppc\IR\OpCode::FNeg,
                     \Cppc\IR\OpCode::IntToFloat  => true,
                     \Cppc\IR\OpCode::LoadFloat   => true,
+                    // Instructions with isFloatDef set (Call returns, Load of float vars).
+                    \Cppc\IR\OpCode::Call,
+                    \Cppc\IR\OpCode::Load,
+                    \Cppc\IR\OpCode::LoadGlobal  => $inst->isFloatDef,
                     // FCmp* and FloatToInt produce integer results.
                     default => false,
                 };

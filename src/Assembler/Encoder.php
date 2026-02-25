@@ -235,6 +235,7 @@ class Encoder
             'ucomisd' => $this->encodeSSEOp(0x66, 0x2E, $ops),
             'cvtsi2sd' => $this->encodeCvtsi2sd($ops),
             'cvtsd2si' => $this->encodeCvtsd2si($ops),
+            'cvttsd2si' => $this->encodeCvttsd2si($ops),
             'movq_sse' => $this->encodeMovqSSE($ops),
             default => throw new \RuntimeException("Unknown mnemonic: {$mn}"),
         };
@@ -249,7 +250,7 @@ class Encoder
     {
         // SSE mnemonics — return as-is
         $sse = ['movsd','addsd','subsd','mulsd','divsd','xorpd','ucomisd',
-                'cvtsi2sd','cvtsd2si'];
+                'cvtsi2sd','cvtsd2si','cvttsd2si'];
         if (in_array($mn, $sse, true)) {
             return [$mn, 0];
         }
@@ -297,7 +298,7 @@ class Encoder
                   'setb','setbe','seta','setae',
                   'movzx','movsx','movsxd',
                   'movsd','addsd','subsd','mulsd','divsd',
-                  'xorpd','ucomisd','cvtsi2sd','cvtsd2si'];
+                  'xorpd','ucomisd','cvtsi2sd','cvtsd2si','cvttsd2si'];
         if (in_array($mn, $bases, true)) {
             return [$mn, $this->inferSize($ops)];
         }
@@ -346,6 +347,25 @@ class Encoder
     {
         $src = $ops[0];
         $dst = $ops[1];
+
+        if ($src->kind === OperandKind::SymbolImm) {
+            // mov $symbol, %reg → REX.W + C7 /0 + imm32 with R_X86_64_32S relocation
+            if ($dst->kind !== OperandKind::Register) {
+                throw new \RuntimeException('Symbol immediate to memory not supported');
+            }
+            $rn = $this->regNum($dst->reg);
+            $this->emit8(0x48 | (($rn >> 3) & 1)); // REX.W + B
+            $this->emit8(0xC7);
+            $this->emit8(0xC0 | ($rn & 7));
+            $this->relocs[] = new Relocation(
+                $this->sectionName,
+                strlen($this->bytes),
+                '32S',
+                $src->label,
+            );
+            $this->emitLE32(0);
+            return;
+        }
 
         if ($src->kind === OperandKind::Immediate) {
             if ($dst->kind === OperandKind::Register) {
@@ -459,6 +479,21 @@ class Encoder
     {
         $src = $ops[0];
         $dst = $ops[1];
+
+        if ($src->kind === OperandKind::SymbolImm) {
+            // cmp/add/sub/etc $symbol, r/m → REX.W + 81 /ext + imm32 with R_X86_64_32S
+            $this->emitRex(true, $immExt, $dst, 8);
+            $this->emit8(0x81);
+            $this->emitModRM($immExt, $dst);
+            $this->relocs[] = new Relocation(
+                $this->sectionName,
+                strlen($this->bytes),
+                '32S',
+                $src->label,
+            );
+            $this->emitLE32(0);
+            return;
+        }
 
         if ($src->kind === OperandKind::Immediate) {
             $imm = $src->imm;
@@ -821,6 +856,18 @@ class Encoder
         $this->emitRex(true, $dstRn, $src, 8); // REX.W for 64-bit integer dest
         $this->emit8(0x0F);
         $this->emit8(0x2D);
+        $this->emitModRM($dstRn, $src);
+    }
+
+    private function encodeCvttsd2si(array $ops): void
+    {
+        $src = $ops[0];
+        $dst = $ops[1];
+        $dstRn = $this->regNum($dst->reg);
+        $this->emit8(0xF2);
+        $this->emitRex(true, $dstRn, $src, 8); // REX.W for 64-bit integer dest
+        $this->emit8(0x0F);
+        $this->emit8(0x2C);
         $this->emitModRM($dstRn, $src);
     }
 

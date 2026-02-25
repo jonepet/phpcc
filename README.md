@@ -273,6 +273,50 @@ Static ELF binary               Linked executable
 
 Zero regular expressions in the entire compiler. The lexer, preprocessor, parser, and assembler all use manual character-by-character scanning. This is what happens when you let PHP developers read the Dragon Book.
 
+### The Native PHP Linker
+
+The linker is the part where PHP developers will feel most at home, because dynamic linking is basically `<a href="">` for machine code.
+
+Think about it. An HTML page says `<a href="about.html">About</a>` and the browser resolves that reference at load time. An ELF binary says `call printf@PLT` and the dynamic linker resolves that reference at load time. Same concept. One links web pages, the other links machine code. PHP has been generating the first kind since 1995. Now it generates both.
+
+Here's what the PHP linker actually does:
+
+```
+Your code calls printf()
+        |
+        v
+Linker sees unresolved symbol "printf"
+        |
+        v
+Builds a PLT stub ─── 16 bytes of x86-64 that says
+                       "jump to wherever GOT[n] points"
+        |
+        v
+Builds a GOT entry ── 8 bytes that initially points back
+                       to the resolver (like a 302 redirect)
+        |
+        v
+Writes .rela.plt ──── tells ld-linux: "fill GOT[n] with
+                       the real address of printf at runtime"
+        |
+        v
+Writes DT_NEEDED ──── "libc.so.6" (the <script src=""> of ELF)
+```
+
+In PHP, this is just `pack('P', $gotAddress)` and string concatenation. The PLT stub is 16 bytes assembled by the PHP encoder. The GOT is an array of 64-bit addresses packed into a string. The `.dynamic` section is key-value pairs — essentially an associative array serialized to binary. PHP was born for this.
+
+The SysV hash table that lets `ld-linux` look up symbols at runtime? It's a hash map. PHP developers have been writing hash maps since they discovered `$_SESSION`. The ELF version just uses `pack('V', ...)` instead of `serialize()`.
+
+```php
+// This is actual linker code. In PHP. Building a PLT entry.
+// It's just string concatenation with extra steps.
+$plt .= "\xFF\x25" . pack('V', $gotOffset)   // jmpq *GOT(%rip)
+       . "\x68" . pack('V', $relocIndex)       // pushq $reloc_index
+       . "\xE9" . pack('V', $pltZeroOffset);   // jmpq PLT[0]
+```
+
+The entire dynamic linker output — GOT, PLT, `.dynamic`, `.dynsym`, `.hash`, relocations — is roughly 400 lines of PHP. It reads `.so` files to discover exported symbols (`DynSymReader`), builds the GOT/PLT trampolines (`GotPltBuilder`), lays out sections with proper alignment (`Linker`), and writes the ELF with program headers that tell the kernel how to map it (`ElfWriter`). No `ld`. No `gold`. No `mold`. Just PHP doing what PHP does best: generating output one byte at a time, except this time the output is executable.
+
 ### Security-Hardened Compilation
 
 cppc is the first C++ compiler to leverage PHP's battle-tested security primitives in the compilation pipeline. `addslashes()` is applied to string literals during code generation to prevent SQL injection in the output binary. While no other compiler vendor has acknowledged this attack vector, we believe it is only a matter of time before a malicious C++ string literal finds its way into a database query at runtime, and cppc will be ready.

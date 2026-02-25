@@ -17,6 +17,7 @@ use Cppc\Assembler\Parser as AsmParser;
 use Cppc\Assembler\Encoder;
 use Cppc\Assembler\Linker;
 use Cppc\Assembler\ElfWriter;
+use Cppc\Assembler\ObjectWriter;
 use Cppc\Assembler\ElfReader;
 use Cppc\Assembler\DynSymReader;
 use Cppc\Assembler\GotPltBuilder;
@@ -226,7 +227,7 @@ class Compiler
     }
 
     /**
-     * Compile to .o via system assembler (`as`).
+     * Compile to .o using the PHP-based assembler pipeline.
      * Returns the path to the created object file.
      */
     public function compileToObject(string $source, string $file = '', string $sourceDir = '', string $outputPath = ''): string
@@ -237,18 +238,43 @@ class Compiler
             $outputPath = tempnam(sys_get_temp_dir(), 'cppc_') . '.o';
         }
 
-        $asmPath = tempnam(sys_get_temp_dir(), 'cppc_') . '.s';
-        file_put_contents($asmPath, $assembly);
+        $parser = new AsmParser();
+        $encoder = new Encoder();
+        $objectWriter = new ObjectWriter();
 
-        $cmd = sprintf('as -o %s %s 2>&1', escapeshellarg($outputPath), escapeshellarg($asmPath));
-        exec($cmd, $output, $exitCode);
-        unlink($asmPath);
-
-        if ($exitCode !== 0) {
-            throw new CompileError("Assembler failed: " . implode("\n", $output));
+        $parsed = $parser->parse($assembly);
+        $sections = [];
+        foreach ($parsed['sections'] as $secName => $lines) {
+            if ($lines !== []) {
+                $sections[] = $encoder->encode($secName, $lines);
+            }
         }
 
+        $elfBytes = $objectWriter->write($sections, $parsed['globals']);
+        file_put_contents($outputPath, $elfBytes);
+
         return $outputPath;
+    }
+
+    /**
+     * Assemble a raw assembly source (.s/.asm) to .o using the PHP assembler.
+     */
+    public function assembleToObject(string $asmSource, string $outputPath): void
+    {
+        $parser = new AsmParser();
+        $encoder = new Encoder();
+        $objectWriter = new ObjectWriter();
+
+        $parsed = $parser->parse($asmSource);
+        $sections = [];
+        foreach ($parsed['sections'] as $secName => $lines) {
+            if ($lines !== []) {
+                $sections[] = $encoder->encode($secName, $lines);
+            }
+        }
+
+        $elfBytes = $objectWriter->write($sections, $parsed['globals']);
+        file_put_contents($outputPath, $elfBytes);
     }
 
     /**
@@ -258,21 +284,20 @@ class Compiler
      * @param string[] $libraries  e.g. ['m', 'pthread']
      * @param string[] $libPaths   e.g. ['/usr/local/lib']
      */
-    public function link(array $objectFiles, string $outputPath, array $libraries = [], array $libPaths = []): void
+    public function link(array $objectFiles, string $outputPath, array $libraries = [], array $libPaths = [], array $sharedLibraries = [], bool $buildShared = false, ?string $soname = null): void
     {
         $elfReader = new ElfReader();
         $dynSymReader = new DynSymReader();
         $linker = new Linker();
 
-        // Read CRT objects for proper _start entry
-        $crtPaths = $this->findCrtObjects();
-        $crtOrder = ['crt1.o', 'crti.o']; // prefix
-        $crtSuffix = ['crtn.o'];           // suffix
-
-        foreach ($crtOrder as $crtName) {
-            if (isset($crtPaths[$crtName])) {
-                $module = $elfReader->readFile($crtPaths[$crtName]);
-                $linker->addModule($module['sections'], $module['globals']);
+        // Read CRT objects for proper _start entry (not needed for shared libraries)
+        if (!$buildShared) {
+            $crtPaths = $this->findCrtObjects();
+            foreach (['crt1.o', 'crti.o'] as $crtName) {
+                if (isset($crtPaths[$crtName])) {
+                    $module = $elfReader->readFile($crtPaths[$crtName]);
+                    $linker->addModule($module['sections'], $module['globals']);
+                }
             }
         }
 
@@ -282,17 +307,34 @@ class Compiler
             $linker->addModule($module['sections'], $module['globals']);
         }
 
-        // Read CRT suffix
-        foreach ($crtSuffix as $crtName) {
-            if (isset($crtPaths[$crtName])) {
-                $module = $elfReader->readFile($crtPaths[$crtName]);
-                $linker->addModule($module['sections'], $module['globals']);
+        // Read CRT suffix (not needed for shared libraries)
+        if (!$buildShared) {
+            foreach (['crtn.o'] as $crtName) {
+                if (isset($crtPaths[$crtName])) {
+                    $module = $elfReader->readFile($crtPaths[$crtName]);
+                    $linker->addModule($module['sections'], $module['globals']);
+                }
             }
         }
 
         // Resolve library symbols
         $neededLibs = ['libc.so.6']; // Always need libc
         $availableExternals = [];
+
+        // Read symbols from .so files passed directly as inputs
+        foreach ($sharedLibraries as $soFile) {
+            if (file_exists($soFile)) {
+                $exports = $dynSymReader->readFile($soFile);
+                foreach ($exports as $sym) {
+                    $availableExternals[$sym] = true;
+                }
+                // Use SONAME from .dynamic section (what the runtime linker expects)
+                $soName = $dynSymReader->readSoname($soFile) ?? basename($soFile);
+                if (!in_array($soName, $neededLibs, true) && $soName !== 'libc.so.6') {
+                    $neededLibs[] = $soName;
+                }
+            }
+        }
 
         foreach ($libraries as $lib) {
             $soPath = $dynSymReader->findLibrary($lib, $libPaths);
@@ -301,21 +343,49 @@ class Compiler
                 foreach ($exports as $sym) {
                     $availableExternals[$sym] = true;
                 }
-                // Determine .so name for DT_NEEDED
-                $soName = basename($soPath);
-                // Extract SONAME pattern: libfoo.so.N
+                // Use SONAME from .dynamic section for DT_NEEDED
+                $soName = $dynSymReader->readSoname($soPath) ?? basename($soPath);
                 if (!in_array($soName, $neededLibs, true) && $soName !== 'libc.so.6') {
                     $neededLibs[] = $soName;
                 }
             }
         }
 
-        // Also read libc exports
+        // Also read libc exports (detailed — we need type info for copy relocations)
+        /** @var array<string, array{type: string, size: int}> */
+        $externalSymbolInfo = [];
         $libcPath = $dynSymReader->findLibrary('c', $libPaths);
         if ($libcPath !== null) {
             $exports = $dynSymReader->readFile($libcPath);
             foreach ($exports as $sym) {
                 $availableExternals[$sym] = true;
+            }
+            $detailed = $dynSymReader->readFileDetailed($libcPath);
+            foreach ($detailed as $name => $info) {
+                $externalSymbolInfo[$name] = $info;
+            }
+        }
+
+        // Also read detailed info from other libraries
+        foreach ($libraries as $lib) {
+            $soPath = $dynSymReader->findLibrary($lib, $libPaths);
+            if ($soPath !== null) {
+                $detailed = $dynSymReader->readFileDetailed($soPath);
+                foreach ($detailed as $name => $info) {
+                    if (!isset($externalSymbolInfo[$name])) {
+                        $externalSymbolInfo[$name] = $info;
+                    }
+                }
+            }
+        }
+        foreach ($sharedLibraries as $soFile) {
+            if (file_exists($soFile)) {
+                $detailed = $dynSymReader->readFileDetailed($soFile);
+                foreach ($detailed as $name => $info) {
+                    if (!isset($externalSymbolInfo[$name])) {
+                        $externalSymbolInfo[$name] = $info;
+                    }
+                }
             }
         }
 
@@ -326,12 +396,18 @@ class Compiler
         // Scan for GOTPCREL relocations — these need GOT entries (PIC code)
         // Both defined and undefined symbols referenced via GOTPCREL need GOT entries
         $gotpcrelSymbols = [];
-        foreach ($linker->getSections() as $sec) {
+        $definedSymbols = $linker->getSymbols();
+        $allSections = $linker->getSections();
+        foreach ($allSections as $sec) {
             foreach ($sec->relocs as $reloc) {
                 if ($reloc->type === 'GOTPCREL') {
+                    // Skip section-relative targets (not real GOT needs)
+                    if (isset($allSections[$reloc->target])) {
+                        continue;
+                    }
                     $gotpcrelSymbols[$reloc->target] = true;
                     // Only mark undefined symbols as dynamic
-                    if (!isset($linker->getSymbols()[$reloc->target])) {
+                    if (!isset($definedSymbols[$reloc->target])) {
                         $linker->markDynamic($reloc->target);
                     }
                 }
@@ -343,17 +419,52 @@ class Compiler
             $gotPlt->addGotDataSymbol($name);
         }
 
-        // Add PLT entries for other undefined symbols (function calls via jmp, not GOTPCREL)
+        // Add PLT entries for function calls, copy relocations for data symbols
         foreach ($undefined as $name) {
-            if (!isset($gotpcrelSymbols[$name])) {
-                // Regular PLT for function calls
+            if (isset($gotpcrelSymbols[$name])) {
+                continue; // Already handled via GOT
+            }
+
+            $symInfo = $externalSymbolInfo[$name] ?? null;
+            if ($symInfo !== null && $symInfo['type'] === 'object') {
+                // Data symbol (e.g., stderr, stdout, stdin) → copy relocation
+                // Allocate space in .bss, dynamic linker copies the value at startup
+                $gotPlt->addCopySymbol($name, $symInfo['size']);
+            } else {
+                // Function or unknown type → PLT entry
                 $linker->markDynamic($name);
                 $gotPlt->addPltSymbol($name);
             }
         }
 
-        // Compute layout
-        $layout = ElfWriter::computeDynLayout($linker, $gotPlt);
+        // Allocate BSS space for copy relocation symbols
+        $bssSection = $linker->getSections()['.bss'] ?? null;
+        $currentBssSize = $bssSection !== null ? strlen($bssSection->bytes) : 0;
+        $newBssSize = $gotPlt->allocateCopyBss($currentBssSize);
+
+        // Register copy symbols with the linker as local .bss symbols
+        // so REL32 relocations resolve to the BSS copy addresses
+        foreach ($gotPlt->getCopyBssOffsets() as $name => $bssOffset) {
+            $linker->addCopySymbol($name, $bssOffset);
+        }
+
+        // Ensure .bss is large enough for copy allocations
+        if ($newBssSize > $currentBssSize) {
+            $linker->extendBss($newBssSize);
+        }
+
+        // Compute layout with exact segment sizes
+        $layout = ElfWriter::computeDynLayout($linker, $gotPlt, $neededLibs);
+
+        // Pre-fill GOT entries for locally-defined GOTPCREL symbols
+        // (ET_EXEC has fixed addresses, so we can resolve at link time)
+        foreach (array_keys($gotpcrelSymbols) as $name) {
+            if (isset($definedSymbols[$name])) {
+                $sym = $definedSymbols[$name];
+                $symVAddr = ($layout['vaddrs'][$sym->section] ?? 0) + $sym->offset;
+                $gotPlt->setGotEntryValue($name, $symVAddr);
+            }
+        }
 
         // Build PLT address map for relocation resolution
         $pltAddrs = [];
@@ -372,13 +483,31 @@ class Compiler
 
         // Build final ELF
         $elfWriter = new ElfWriter();
-        $binary = $elfWriter->buildDynExecutable(
-            $linker->getSections(),
-            $layout['entry'] ?? throw new CompileError('No entry point found'),
-            $layout['vaddrs'],
-            $gotPlt,
-            $neededLibs,
-        );
+
+        if ($buildShared) {
+            // Collect exported symbols (all globals)
+            $exportedSymbols = [];
+            foreach ($linker->getSymbols() as $name => $sym) {
+                $exportedSymbols[] = $name;
+            }
+
+            $binary = $elfWriter->buildSharedLibrary(
+                $linker->getSections(),
+                $layout['vaddrs'],
+                $gotPlt,
+                $neededLibs,
+                $soname ?? basename($outputPath),
+                $exportedSymbols,
+            );
+        } else {
+            $binary = $elfWriter->buildDynExecutable(
+                $linker->getSections(),
+                $layout['entry'] ?? throw new CompileError('No entry point found'),
+                $layout['vaddrs'],
+                $gotPlt,
+                $neededLibs,
+            );
+        }
 
         file_put_contents($outputPath, $binary);
         chmod($outputPath, 0755);

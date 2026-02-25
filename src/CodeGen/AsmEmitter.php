@@ -270,6 +270,7 @@ class AsmEmitter
     public function cvtsi2sd(string $src, string $dst): void    { $this->emit('cvtsi2sd', $src, $dst); }
     public function cvtss2si(string $src, string $dst): void    { $this->emit('cvtss2si', $src, $dst); }
     public function cvtsd2si(string $src, string $dst): void    { $this->emit('cvtsd2si', $src, $dst); }
+    public function cvttsd2si(string $src, string $dst): void   { $this->emit('cvttsd2si', $src, $dst); }
     public function cvtss2sd(string $src, string $dst): void    { $this->emit('cvtss2sd', $src, $dst); }
     public function cvtsd2ss(string $src, string $dst): void    { $this->emit('cvtsd2ss', $src, $dst); }
 

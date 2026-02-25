@@ -9,6 +9,9 @@ class Instruction
     /** Whether this Call instruction targets a variadic function (SysV ABI: must set %al). */
     public bool $isVariadicCall = false;
 
+    /** Whether this instruction defines a floating-point result (for register allocation). */
+    public bool $isFloatDef = false;
+
     public function __construct(
         public readonly OpCode $opcode,
         public readonly ?Operand $dest = null,

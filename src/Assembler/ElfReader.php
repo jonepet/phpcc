@@ -277,7 +277,8 @@ class ElfReader
         // Convert ELF relocation type to internal type
         $type = match ($elfType) {
             Relocation::R_X86_64_PC32     => 'REL32',
-            Relocation::R_X86_64_REX_GOTPCREL => 'GOTPCREL', // AMD64 extension for GOTPCREL
+            Relocation::R_X86_64_GOTPCRELX    => 'GOTPCREL', // relaxable GOTPCREL
+            Relocation::R_X86_64_REX_GOTPCRELX => 'GOTPCREL', // relaxable GOTPCREL with REX
             Relocation::R_X86_64_PLT32    => 'REL32', // PLT32 treated as REL32 for non-PIC linking
             Relocation::R_X86_64_64       => 'ABS64',
             Relocation::R_X86_64_32S      => '32S',

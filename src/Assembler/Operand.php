@@ -61,6 +61,14 @@ class Operand
         return $o;
     }
 
+    public static function symbolImm(string $name): self
+    {
+        $o = new self();
+        $o->kind = OperandKind::SymbolImm;
+        $o->label = $name;
+        return $o;
+    }
+
     public static function label(string $name): self
     {
         $o = new self();

@@ -10,12 +10,19 @@ namespace Cppc\Assembler;
  */
 class DynSymReader
 {
-    private const SHT_DYNSYM = 11;
-    private const SHT_STRTAB = 3;
+    private const SHT_DYNSYM  = 11;
+    private const SHT_STRTAB  = 3;
+    private const SHT_DYNAMIC = 6;
+    private const DT_SONAME   = 14;
 
     // Symbol binding
     private const STB_GLOBAL = 1;
     private const STB_WEAK   = 2;
+
+    // Symbol types
+    private const STT_NOTYPE = 0;
+    private const STT_OBJECT = 1;
+    private const STT_FUNC   = 2;
 
     // Special section indices
     private const SHN_UNDEF = 0;
@@ -107,6 +114,118 @@ class DynSymReader
     }
 
     /**
+     * Read exported symbols with type and size information.
+     * Returns detailed info needed for copy relocations.
+     *
+     * @return array<string, array{type: string, size: int}> name → {type, size}
+     */
+    public function readDetailed(string $elfBytes): array
+    {
+        if (substr($elfBytes, 0, 4) !== "\x7FELF") {
+            throw new \RuntimeException('Not a valid ELF file');
+        }
+
+        $eShoff     = $this->u64($elfBytes, 40);
+        $eShentsize = $this->u16($elfBytes, 58);
+        $eShnum     = $this->u16($elfBytes, 60);
+
+        $shdrs = [];
+        for ($i = 0; $i < $eShnum; $i++) {
+            $off = $eShoff + $i * $eShentsize;
+            $shdrs[] = [
+                'type'   => $this->u32($elfBytes, $off + 4),
+                'offset' => $this->u64($elfBytes, $off + 24),
+                'size'   => $this->u64($elfBytes, $off + 32),
+                'link'   => $this->u32($elfBytes, $off + 40),
+            ];
+        }
+
+        $dynsymShdr = null;
+        foreach ($shdrs as $shdr) {
+            if ($shdr['type'] === self::SHT_DYNSYM) {
+                $dynsymShdr = $shdr;
+                break;
+            }
+        }
+
+        if ($dynsymShdr === null) {
+            return [];
+        }
+
+        $dynstrIdx = $dynsymShdr['link'];
+        if ($dynstrIdx >= count($shdrs)) {
+            return [];
+        }
+        $dynstr = substr($elfBytes, $shdrs[$dynstrIdx]['offset'], $shdrs[$dynstrIdx]['size']);
+
+        $result = [];
+        $numSyms = intdiv($dynsymShdr['size'], 24);
+        for ($i = 0; $i < $numSyms; $i++) {
+            $symOff = $dynsymShdr['offset'] + $i * 24;
+
+            $stName  = $this->u32($elfBytes, $symOff);
+            $stInfo  = ord($elfBytes[$symOff + 4]);
+            $stShndx = $this->u16($elfBytes, $symOff + 6);
+            $stSize  = $this->u64($elfBytes, $symOff + 16);
+
+            $binding = ($stInfo >> 4) & 0xF;
+            $sttType = $stInfo & 0xF;
+
+            if ($stShndx === self::SHN_UNDEF) {
+                continue;
+            }
+            if ($binding !== self::STB_GLOBAL && $binding !== self::STB_WEAK) {
+                continue;
+            }
+
+            $name = $this->readString($dynstr, $stName);
+            if ($name === '') {
+                continue;
+            }
+
+            $atPos = strpos($name, '@');
+            if ($atPos !== false) {
+                $name = substr($name, 0, $atPos);
+            }
+
+            $typeStr = match ($sttType) {
+                self::STT_FUNC => 'func',
+                self::STT_OBJECT => 'object',
+                default => 'notype',
+            };
+
+            $result[$name] = ['type' => $typeStr, 'size' => $stSize];
+        }
+
+        return $result;
+    }
+
+    /**
+     * Read detailed symbols from a shared library file.
+     * Handles GNU ld scripts.
+     *
+     * @return array<string, array{type: string, size: int}>
+     */
+    public function readFileDetailed(string $path): array
+    {
+        $bytes = file_get_contents($path);
+        if ($bytes === false) {
+            throw new \RuntimeException("Cannot read shared library: {$path}");
+        }
+
+        if (str_starts_with($bytes, '/*') || str_starts_with($bytes, 'OUTPUT_FORMAT')
+            || str_starts_with($bytes, 'GROUP')) {
+            $realPath = $this->parseLinkerScript($bytes, dirname($path));
+            if ($realPath !== null) {
+                return $this->readFileDetailed($realPath);
+            }
+            return [];
+        }
+
+        return $this->readDetailed($bytes);
+    }
+
+    /**
      * Read exported symbols from a shared library file.
      * Handles GNU ld scripts that reference the actual .so file.
      *
@@ -130,6 +249,66 @@ class DynSymReader
         }
 
         return $this->read($bytes);
+    }
+
+    /**
+     * Read the SONAME from a shared library's .dynamic section.
+     * Returns null if no SONAME is set.
+     */
+    public function readSoname(string $path): ?string
+    {
+        $elfBytes = file_get_contents($path);
+        if ($elfBytes === false || substr($elfBytes, 0, 4) !== "\x7FELF") {
+            return null;
+        }
+
+        $eShoff     = $this->u64($elfBytes, 40);
+        $eShentsize = $this->u16($elfBytes, 58);
+        $eShnum     = $this->u16($elfBytes, 60);
+
+        $shdrs = [];
+        for ($i = 0; $i < $eShnum; $i++) {
+            $off = $eShoff + $i * $eShentsize;
+            $shdrs[] = [
+                'type'   => $this->u32($elfBytes, $off + 4),
+                'offset' => $this->u64($elfBytes, $off + 24),
+                'size'   => $this->u64($elfBytes, $off + 32),
+                'link'   => $this->u32($elfBytes, $off + 40),
+            ];
+        }
+
+        // Find .dynamic section and its associated string table
+        $dynShdr = null;
+        foreach ($shdrs as $shdr) {
+            if ($shdr['type'] === self::SHT_DYNAMIC) {
+                $dynShdr = $shdr;
+                break;
+            }
+        }
+        if ($dynShdr === null) {
+            return null;
+        }
+
+        // .dynamic's sh_link points to .dynstr
+        $dynstrIdx = $dynShdr['link'];
+        if ($dynstrIdx >= count($shdrs)) {
+            return null;
+        }
+        $dynstr = substr($elfBytes, $shdrs[$dynstrIdx]['offset'], $shdrs[$dynstrIdx]['size']);
+
+        // Scan .dynamic entries (Elf64_Dyn = 16 bytes: d_tag(8) + d_val(8))
+        $numEntries = intdiv($dynShdr['size'], 16);
+        for ($i = 0; $i < $numEntries; $i++) {
+            $entOff = $dynShdr['offset'] + $i * 16;
+            $tag = $this->u64($elfBytes, $entOff);
+            if ($tag === 0) break; // DT_NULL
+            if ($tag === self::DT_SONAME) {
+                $nameOff = $this->u64($elfBytes, $entOff + 8);
+                return $this->readString($dynstr, $nameOff);
+            }
+        }
+
+        return null;
     }
 
     /**

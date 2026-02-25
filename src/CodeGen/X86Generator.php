@@ -626,7 +626,7 @@ class X86Generator
         $src     = $this->operandToAsm($inst->src1);
 
         // Emit a sign-mask constant into .rodata and load it.
-        $maskLabel = $this->addFloatConst(0x8000000000000000, 'signmask');
+        $maskLabel = $this->addFloatConst(PHP_INT_MIN, 'signmask'); // 0x8000000000000000 sign bit
         $destXmm   = $this->isXmmReg($destLoc) ? $destLoc : 'xmm8';
 
         // Ensure src is in an XMM register.
@@ -634,9 +634,13 @@ class X86Generator
         if ($xmmSrc !== $this->emitter->reg($destXmm)) {
             $this->emitter->movsd($xmmSrc, $this->emitter->reg($destXmm));
         }
+        // Load sign mask via movsd (8-byte aligned OK) into scratch register,
+        // then xorpd register-register (avoids 16-byte alignment requirement
+        // of xorpd with memory operand).
+        $this->emitter->movsd($this->emitter->ripRel($maskLabel), $this->emitter->reg('xmm9'));
         $this->emitter->emit(
             'xorpd',
-            $this->emitter->ripRel($maskLabel),
+            $this->emitter->reg('xmm9'),
             $this->emitter->reg($destXmm),
         );
 
@@ -676,13 +680,13 @@ class X86Generator
             if ($immVal === 0) {
                 $this->emitter->emit('xorpd', $xmm, $xmm);
             } else {
-                // Materialize via GPR.
+                // Integer immediate → convert to double via cvtsi2sd.
                 $this->emitter->mov($loc, $this->emitter->reg('rax'));
-                $this->emitter->emit('movq', $this->emitter->reg('rax'), $xmm);
+                $this->emitter->cvtsi2sd($this->emitter->reg('rax'), $xmm);
             }
         } elseif ($this->isGPReg($loc)) {
-            // GPR → XMM: use movq (not movsd which only works for memory/xmm).
-            $this->emitter->emit('movq', $loc, $xmm);
+            // GPR → XMM: bit-pattern copy (value may be a float in a GPR due to spill).
+            $this->emitter->mov($loc, $xmm);
         } else {
             // Memory → XMM: movsd works fine.
             $this->emitter->movsd($loc, $xmm);
@@ -1331,7 +1335,7 @@ class X86Generator
         }
     }
 
-    /** Truncates toward zero per cvtsd2si semantics. */
+    /** Truncates toward zero — C standard (int) cast semantics. */
     private function emitFloatToInt(Instruction $inst): void
     {
         assert($inst->dest !== null && $inst->src1 !== null);
@@ -1347,7 +1351,7 @@ class X86Generator
         }
 
         $destReg = $this->ensureGPReg($destLoc, 'rax');
-        $this->emitter->cvtsd2si(
+        $this->emitter->cvttsd2si(
             $this->emitter->reg($srcXmm),
             $this->emitter->reg($destReg),
         );

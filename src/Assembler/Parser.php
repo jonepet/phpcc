@@ -270,9 +270,14 @@ class Parser
             return Operand::register(substr($s, 1));
         }
 
-        // Immediate: $val
+        // Immediate: $val or $symbol_name
         if ($s[0] === '$') {
-            return Operand::immediate($this->parseImmediateValue(substr($s, 1)));
+            $immStr = substr($s, 1);
+            // If it starts with a letter or underscore, it's a symbol reference
+            if ($immStr !== '' && ($immStr[0] === '_' || ctype_alpha($immStr[0]))) {
+                return Operand::symbolImm($immStr);
+            }
+            return Operand::immediate($this->parseImmediateValue($immStr));
         }
 
         // Parenthesized form: [prefix](...)

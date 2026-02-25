@@ -39,6 +39,15 @@ class GotPltBuilder
     /** @var array<string, int> symbol name → GOT data index (0-based) */
     private array $gotDataIndex = [];
 
+    /** @var array<string, int> symbol name → pre-filled GOT entry value (for defined symbols) */
+    private array $gotEntryValues = [];
+
+    /** @var array<string, int> symbol name → size for copy relocations */
+    private array $copySymbols = [];
+
+    /** @var array<string, int> symbol name → BSS offset for copy relocations */
+    private array $copyBssOffsets = [];
+
     /**
      * Add a function symbol that needs a PLT entry.
      */
@@ -70,11 +79,29 @@ class GotPltBuilder
     }
 
     /**
+     * Pre-fill a GOT entry with a known address (for locally-defined symbols).
+     */
+    public function setGotEntryValue(string $name, int $value): void
+    {
+        $this->gotEntryValues[$name] = $value;
+    }
+
+    /**
      * @return string[] GOT data symbol names
      */
     public function getGotDataSymbols(): array
     {
         return $this->gotDataSymbols;
+    }
+
+    /**
+     * @return string[] Only GOT data symbols that are undefined (not pre-filled)
+     */
+    public function getUndefinedGotDataSymbols(): array
+    {
+        return array_values(array_filter($this->gotDataSymbols, function (string $name): bool {
+            return !isset($this->gotEntryValues[$name]);
+        }));
     }
 
     /**
@@ -196,11 +223,20 @@ class GotPltBuilder
 
     /**
      * Build the .got section bytes (for GLOB_DAT data symbols).
-     * All entries initialized to 0 (filled by dynamic linker).
+     * Undefined entries are 0 (filled by dynamic linker).
+     * Defined entries are pre-filled with their virtual address.
      */
     public function buildGot(): string
     {
-        return str_repeat("\0", count($this->gotDataSymbols) * self::GOT_ENTRY_SIZE);
+        $bytes = '';
+        foreach ($this->gotDataSymbols as $name) {
+            if (isset($this->gotEntryValues[$name])) {
+                $bytes .= pack('P', $this->gotEntryValues[$name]);
+            } else {
+                $bytes .= str_repeat("\0", self::GOT_ENTRY_SIZE);
+            }
+        }
+        return $bytes;
     }
 
     /**
@@ -226,6 +262,7 @@ class GotPltBuilder
 
     /**
      * Build .rela.dyn entries (R_X86_64_GLOB_DAT).
+     * Only emits entries for undefined symbols (not pre-filled).
      *
      * @param int $gotVAddr  Virtual address of .got
      * @param array<string, int> $dynSymIndex  symbol name → index in .dynsym
@@ -234,6 +271,11 @@ class GotPltBuilder
     {
         $bytes = '';
         foreach ($this->gotDataSymbols as $idx => $name) {
+            // Skip locally-defined symbols — their GOT entries are pre-filled
+            if (isset($this->gotEntryValues[$name])) {
+                continue;
+            }
+
             $gotEntryAddr = $gotVAddr + $idx * self::GOT_ENTRY_SIZE;
             $symIdx = $dynSymIndex[$name] ?? 0;
             $rInfo = ($symIdx << 32) | 6; // R_X86_64_GLOB_DAT = 6
@@ -275,5 +317,76 @@ class GotPltBuilder
     public function hasPltEntry(string $name): bool
     {
         return isset($this->pltIndex[$name]);
+    }
+
+    /**
+     * Add a copy relocation symbol (external data variable like stderr/stdout).
+     * The symbol will be allocated in the executable's BSS and an R_X86_64_COPY
+     * relocation will tell the dynamic linker to copy the value from the .so.
+     *
+     * @param string $name Symbol name
+     * @param int $size Size to allocate in BSS (from .so's .dynsym st_size)
+     */
+    public function addCopySymbol(string $name, int $size): void
+    {
+        if (!isset($this->copySymbols[$name])) {
+            $this->copySymbols[$name] = max($size, 8); // At least pointer-sized
+        }
+    }
+
+    /**
+     * @return array<string, int> name → size
+     */
+    public function getCopySymbols(): array
+    {
+        return $this->copySymbols;
+    }
+
+    /**
+     * Allocate BSS offsets for copy symbols.
+     * Must be called before building .rela.dyn for copy relocations.
+     *
+     * @param int $bssCurrentSize Current .bss size before copy allocations
+     * @return int New .bss size after copy allocations
+     */
+    public function allocateCopyBss(int $bssCurrentSize): int
+    {
+        $offset = $bssCurrentSize;
+        foreach ($this->copySymbols as $name => $size) {
+            // Align to 8 bytes
+            $offset = ($offset + 7) & ~7;
+            $this->copyBssOffsets[$name] = $offset;
+            $offset += $size;
+        }
+        return $offset;
+    }
+
+    /**
+     * @return array<string, int> symbol name → BSS offset
+     */
+    public function getCopyBssOffsets(): array
+    {
+        return $this->copyBssOffsets;
+    }
+
+    /**
+     * Build .rela.dyn entries for copy relocations (R_X86_64_COPY = 5).
+     *
+     * @param int $bssVAddr Virtual address of .bss section
+     * @param array<string, int> $dynSymIndex symbol name → index in .dynsym
+     */
+    public function buildRelaCopy(int $bssVAddr, array $dynSymIndex): string
+    {
+        $bytes = '';
+        foreach ($this->copySymbols as $name => $size) {
+            $bssOffset = $this->copyBssOffsets[$name] ?? 0;
+            $symIdx = $dynSymIndex[$name] ?? 0;
+            $rInfo = ($symIdx << 32) | 5; // R_X86_64_COPY = 5
+
+            $bytes .= pack('P', $bssVAddr + $bssOffset); // r_offset
+            $bytes .= pack('P', $rInfo);                   // r_info
+            $bytes .= pack('P', 0);                        // r_addend
+        }
+        return $bytes;
     }
 }

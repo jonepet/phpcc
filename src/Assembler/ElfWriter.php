@@ -206,13 +206,34 @@ class ElfWriter
             $dynSymEntries[] = $this->symEntry($nameOff, $stInfo, 0, 0, 0); // SHN_UNDEF
         }
 
-        // Add symbols for GOT data entries (undefined data references)
-        foreach ($gotDataSymbols as $name) {
+        // Add symbols for GOT data entries (only undefined/dynamic ones)
+        $undefinedGotDataSymbols = $gotPlt->getUndefinedGotDataSymbols();
+        foreach ($undefinedGotDataSymbols as $name) {
+            if (isset($dynSymIndex[$name])) {
+                continue; // Already added as a PLT symbol
+            }
             $nameOff = strlen($dynstr);
             $dynstr .= $name . "\0";
             $stInfo = (1 << 4) | 0; // STB_GLOBAL | STT_NOTYPE
             $dynSymIndex[$name] = count($dynSymEntries);
             $dynSymEntries[] = $this->symEntry($nameOff, $stInfo, 0, 0, 0); // SHN_UNDEF
+        }
+
+        // Add copy relocation symbols (external data like stderr, stdout)
+        // These get BSS addresses — entries are patched after layout is known
+        $copySymbols = $gotPlt->getCopySymbols();
+        $copySymEntryIndices = []; // name → index in dynSymEntries
+        foreach ($copySymbols as $name => $size) {
+            if (isset($dynSymIndex[$name])) {
+                continue;
+            }
+            $nameOff = strlen($dynstr);
+            $dynstr .= $name . "\0";
+            $stInfo = (1 << 4) | 1; // STB_GLOBAL | STT_OBJECT
+            $dynSymIndex[$name] = count($dynSymEntries);
+            $copySymEntryIndices[$name] = count($dynSymEntries);
+            // st_value=0 placeholder, st_size=size; shndx will be .bss section index
+            $dynSymEntries[] = $this->symEntry($nameOff, $stInfo, 0, $size, 0); // SHN_UNDEF placeholder
         }
 
         // Add DT_NEEDED library names to dynstr
@@ -228,7 +249,8 @@ class ElfWriter
         }
 
         // Build .hash (SysV hash)
-        $hashBytes = $this->buildSysVHash(count($dynSymEntries), $pltSymbols, $dynSymIndex);
+        $allDynNames = array_merge($pltSymbols, $undefinedGotDataSymbols, array_keys($copySymbols));
+        $hashBytes = $this->buildSysVHash(count($dynSymEntries), $allDynNames, $dynSymIndex);
 
         // Calculate program header count
         // PT_PHDR, PT_INTERP, PT_LOAD (RO), PT_LOAD (RX), PT_LOAD (RW), PT_DYNAMIC
@@ -243,6 +265,8 @@ class ElfWriter
         // Build rela sections (need sizes for layout)
         $relaPltBytes = $gotPlt->buildRelaPlt(0, $dynSymIndex); // vaddr placeholder, entries are position-independent
         $relaDynBytes = $gotPlt->buildRelaDyn(0, $dynSymIndex);
+        // Add space for copy relocations in .rela.dyn size estimate
+        $relaDynBytes .= $gotPlt->buildRelaCopy(0, $dynSymIndex);
 
         // Segment 1 (RO) - starts at offset 0
         $seg1FileOff = 0;
@@ -351,6 +375,28 @@ class ElfWriter
         // Now rebuild rela sections with correct vaddrs
         $relaPltBytes = $gotPlt->buildRelaPlt($gotPltVAddr, $dynSymIndex);
         $relaDynBytes = $gotPlt->buildRelaDyn($gotVAddr, $dynSymIndex); // GOT entries for GOTPCREL symbols
+
+        // Patch copy symbol entries with BSS addresses and section index
+        $bssSectionIdx = 11; // .bss section header index
+        foreach ($copySymEntryIndices as $name => $entryIdx) {
+            $bssOffset = $gotPlt->getCopyBssOffsets()[$name] ?? 0;
+            $symVAddr = $bssVAddr + $bssOffset;
+            $copySize = $copySymbols[$name] ?? 8;
+            $entry = $dynSymEntries[$entryIdx];
+            // Rebuild entry: st_name(4) + st_info(1) + st_other(1) + st_shndx(2) + st_value(8) + st_size(8)
+            $dynSymEntries[$entryIdx] = substr($entry, 0, 6)
+                . pack('v', $bssSectionIdx)  // st_shndx = .bss
+                . pack('P', $symVAddr)        // st_value
+                . pack('P', $copySize);       // st_size
+        }
+        // Rebuild dynsym bytes with patched copy entries
+        $dynsymBytes = '';
+        foreach ($dynSymEntries as $entry) {
+            $dynsymBytes .= $entry;
+        }
+
+        // Add copy relocations to .rela.dyn
+        $relaDynBytes .= $gotPlt->buildRelaCopy($bssVAddr, $dynSymIndex);
 
         // Build PLT and GOT.PLT with correct addresses
         $pltBytes = $gotPlt->buildPlt($pltVAddr, $gotPltVAddr);
@@ -617,15 +663,42 @@ class ElfWriter
             $dynSymEntries[] = $this->symEntry($nameOff, $stInfo, 0, 0, 0);
         }
 
-        // Exported symbols
+        // Build symbol → section/offset map from section data
+        $symbolMap = []; // name → ['section' => string, 'offset' => int, 'type' => string]
+        foreach ($sections as $sec) {
+            foreach ($sec->symbols as $sym) {
+                $symbolMap[$sym->name] = [
+                    'section' => $sym->section,
+                    'offset' => $sym->offset,
+                    'type' => $sym->type,
+                ];
+            }
+        }
+
+        // Section name → section header index map (must match shdr order below)
+        $secHdrIdx = ['.text' => 7, '.rodata' => 8, '.data' => 9, '.bss' => 10];
+
+        // Exported symbols (addresses will be patched after layout)
+        $exportedSymMeta = []; // index → ['section' => string, 'offset' => int]
         foreach ($exportedSymbols as $name) {
             if (isset($dynSymIndex[$name])) continue; // already added as import
             $nameOff = strlen($dynstr);
             $dynstr .= $name . "\0";
-            $stInfo = (1 << 4) | 2; // STB_GLOBAL | STT_FUNC
-            $dynSymIndex[$name] = count($dynSymEntries);
-            // Value and section will be patched after layout
-            $dynSymEntries[] = $this->symEntry($nameOff, $stInfo, 0, 0, 8); // section index 8 (.text)
+            $meta = $symbolMap[$name] ?? null;
+            $sttType = 2; // STT_FUNC default
+            if ($meta !== null && $meta['type'] === 'object') $sttType = 1; // STT_OBJECT
+            $stInfo = (1 << 4) | $sttType; // STB_GLOBAL | type
+            $shndx = 7; // default .text
+            if ($meta !== null && isset($secHdrIdx[$meta['section']])) {
+                $shndx = $secHdrIdx[$meta['section']];
+            }
+            $idx = count($dynSymEntries);
+            $dynSymIndex[$name] = $idx;
+            // st_value=0 placeholder — will be patched after layout
+            $dynSymEntries[] = $this->symEntry($nameOff, $stInfo, 0, 0, $shndx);
+            if ($meta !== null) {
+                $exportedSymMeta[$idx] = $meta;
+            }
         }
 
         // SONAME and DT_NEEDED in dynstr
@@ -719,6 +792,29 @@ class ElfWriter
         $gotPltVAddr = $baseAddr + $gotPltOff;
         $dynamicVAddr = $baseAddr + $dynamicOff;
 
+        // Section vaddr map for resolving exported symbol addresses
+        $secVAddrs = [
+            '.text' => $baseAddr + $textOff,
+            '.rodata' => $baseAddr + $rodataOff,
+            '.data' => $baseAddr + $dataOff,
+            '.bss' => $baseAddr + $bssOff,
+        ];
+
+        // Patch exported symbol addresses in dynsym
+        foreach ($exportedSymMeta as $idx => $meta) {
+            $symVAddr = ($secVAddrs[$meta['section']] ?? 0) + $meta['offset'];
+            // Elf64_Sym: st_name(4) + st_info(1) + st_other(1) + st_shndx(2) + st_value(8) + st_size(8)
+            // st_value is at offset 8 within the 24-byte entry
+            $entry = $dynSymEntries[$idx];
+            $dynSymEntries[$idx] = substr($entry, 0, 8) . pack('P', $symVAddr) . substr($entry, 16);
+        }
+
+        // Rebuild dynsym bytes with patched addresses
+        $dynsymBytes = '';
+        foreach ($dynSymEntries as $entry) {
+            $dynsymBytes .= $entry;
+        }
+
         $relaPltBytes = $gotPlt->buildRelaPlt($gotPltVAddr, $dynSymIndex);
         $pltBytes = $gotPlt->buildPlt($pltVAddr, $gotPltVAddr);
         $gotPltBytes = $gotPlt->buildGotPlt($pltVAddr, $dynamicVAddr);
@@ -728,7 +824,7 @@ class ElfWriter
         $shstrtabNames = [];
         $secNames = ['.dynsym', '.dynstr', '.hash',
                      '.rela.plt', '.rela.dyn', '.plt', '.text', '.rodata',
-                     '.data', '.bss', '.got', '.got.plt', '.dynamic', '.shstrtab'];
+                     '.data', '.bss', '.got.plt', '.dynamic', '.shstrtab'];
         foreach ($secNames as $name) {
             $shstrtabNames[$name] = strlen($shstrtab);
             $shstrtab .= $name . "\0";
@@ -736,8 +832,8 @@ class ElfWriter
 
         $shstrtabFileOff = $bssOff;
         $shdrOff = $this->alignUp($shstrtabFileOff + strlen($shstrtab), 8);
-        $numShdrs = 16; // null + 13 sections
-        $shstrtabIdx = 15;
+        $numShdrs = 14; // null + 13 sections
+        $shstrtabIdx = 13;
 
         // Build binary
         $bin = '';
@@ -882,9 +978,15 @@ class ElfWriter
      * Compute section virtual addresses for dynamic executable layout.
      * PLT is placed before .text in the RX segment.
      *
-     * @return array{vaddrs: array<string, int>, entry: int|null, pltVAddr: int, gotPltVAddr: int, dynamicVAddr: int}
+     * Replicates the exact layout logic from buildDynExecutable() so that
+     * relocation resolution uses the correct addresses.
+     *
+     * @param Linker $linker
+     * @param GotPltBuilder $gotPlt
+     * @param string[] $neededLibs Library names (e.g., ['libc.so.6'])
+     * @return array{vaddrs: array<string, int>, entry: int|null, pltVAddr: int, gotVAddr: int, gotPltVAddr: int, dynamicVAddr: int}
      */
-    public static function computeDynLayout(Linker $linker, GotPltBuilder $gotPlt): array
+    public static function computeDynLayout(Linker $linker, GotPltBuilder $gotPlt, array $neededLibs = ['libc.so.6']): array
     {
         $sections = $linker->getSections();
         $textLen   = strlen($sections['.text']->bytes ?? '');
@@ -895,29 +997,100 @@ class ElfWriter
         $gotPltSize = $gotPlt->getGotPltSize();
         $gotSize = $gotPlt->getGotSize();
 
-        // Segment 2 (RX): .plt + .text + .rodata
-        $seg2FileOff = self::PAGE_SIZE; // approximate; actual depends on seg1 size
+        // ── Compute segment 1 (RO) size exactly as buildDynExecutable() does ──
+        // Components: ELF header + phdrs + .interp + .dynsym + .dynstr + .hash + .rela.plt + .rela.dyn
+        $interpSize = strlen(self::INTERP) + 1; // includes null terminator
+
+        $numPhdrs = 6; // PT_PHDR, PT_INTERP, PT_LOAD(RO), PT_LOAD(RX), PT_LOAD(RW), PT_DYNAMIC
+        $phdrsTotalSize = $numPhdrs * self::PHDR_SZ;
+
+        // Build .dynstr and count .dynsym entries (mirrors buildDynExecutable exactly)
+        $pltSymbols = $gotPlt->getPltSymbols();
+        $undefinedGotDataSymbols = $gotPlt->getUndefinedGotDataSymbols();
+        $copySymbols = $gotPlt->getCopySymbols();
+
+        $dynstr = "\0";
+        $numDynSymEntries = 1; // null entry
+        $numDynNames = 0; // named symbols (for hash nbuckets)
+        $seenNames = [];
+
+        foreach ($pltSymbols as $name) {
+            $dynstr .= $name . "\0";
+            $numDynSymEntries++;
+            $numDynNames++;
+            $seenNames[$name] = true;
+        }
+        foreach ($undefinedGotDataSymbols as $name) {
+            if (isset($seenNames[$name])) continue;
+            $dynstr .= $name . "\0";
+            $numDynSymEntries++;
+            $numDynNames++;
+            $seenNames[$name] = true;
+        }
+        foreach ($copySymbols as $name => $size) {
+            if (isset($seenNames[$name])) continue;
+            $dynstr .= $name . "\0";
+            $numDynSymEntries++;
+            $numDynNames++;
+            $seenNames[$name] = true;
+        }
+        foreach ($neededLibs as $lib) {
+            $dynstr .= $lib . "\0";
+        }
+
+        $dynsymSize = $numDynSymEntries * 24;
+        $dynstrSize = strlen($dynstr);
+
+        // Hash table: nbuckets = numDynNames, nchain = numDynSymEntries
+        $nbuckets = max(1, $numDynNames);
+        $hashSize = (2 + $nbuckets + $numDynSymEntries) * 4;
+
+        // Rela sizes (getUndefinedGotDataSymbols already filters pre-filled entries)
+        $relaPltSize = count($pltSymbols) * 24;
+        $relaDynSize = (count($undefinedGotDataSymbols) + count($copySymbols)) * 24;
+
+        // Compute exact segment 1 file offsets
+        $interpOff = self::ELF_HEADER_SZ + $phdrsTotalSize;
+        $dynsymOff = self::alignUpStatic($interpOff + $interpSize, 8);
+        $dynstrOff = $dynsymOff + $dynsymSize;
+        $hashOff = self::alignUpStatic($dynstrOff + $dynstrSize, 4);
+        $relaPltOff = self::alignUpStatic($hashOff + $hashSize, 8);
+        $relaDynOff = $relaPltOff + $relaPltSize;
+        $seg1End = $relaDynOff + $relaDynSize;
+
+        // ── Segment 2 (RX): .plt + .text + .rodata ──
+        $seg2FileOff = self::alignUpStatic($seg1End, self::PAGE_SIZE);
         $seg2VAddr = self::BASE_ADDR + $seg2FileOff;
         $pltVAddr = $seg2VAddr;
         $textVAddr = $pltVAddr + $pltSize;
         $rodataVAddr = $textVAddr + $textLen;
 
-        // Segment 3 (RW): .data + .got + .got.plt + .dynamic
+        // ── Segment 3 (RW): .data + .got + .got.plt + .dynamic + .bss ──
         $seg2End = $seg2FileOff + $pltSize + $textLen + $rodataLen;
         $seg3FileOff = self::alignUpStatic($seg2End, self::PAGE_SIZE);
         $seg3VAddr = self::BASE_ADDR + $seg3FileOff;
         $dataVAddr = $seg3VAddr;
 
         // .got comes before .got.plt for standard layout
-        $gotOff = self::alignUpStatic($dataLen, 8);
-        $gotVAddr = $dataVAddr + $gotOff;
+        // Use file offsets relative to seg3 start (matching buildDynExecutable)
+        $gotFileOff = self::alignUpStatic($seg3FileOff + $dataLen, 8);
+        $gotVAddr = self::BASE_ADDR + $gotFileOff;
 
-        $gotPltOff = $gotOff + $gotSize;
-        $gotPltVAddr = $dataVAddr + $gotPltOff;
-        $dynamicVAddr = $gotPltVAddr + $gotPltSize;
-        $dynamicVAddr = self::alignUpStatic($dynamicVAddr, 8);
+        $gotPltFileOff = self::alignUpStatic($gotFileOff + $gotSize, 8);
+        $gotPltVAddr = self::BASE_ADDR + $gotPltFileOff;
+        $dynamicFileOff = self::alignUpStatic($gotPltFileOff + $gotPltSize, 8);
+        $dynamicVAddr = self::BASE_ADDR + $dynamicFileOff;
 
-        $bssVAddr = $dynamicVAddr + 256; // estimate, refined during build
+        // Compute exact .dynamic section size
+        $numDynEntries = 7 + count($neededLibs); // DT_STRTAB, DT_SYMTAB, DT_STRSZ, DT_SYMENT, DT_HASH, DT_DEBUG, DT_NULL + DT_NEEDED*N
+        if ($pltSize > 0) {
+            $numDynEntries += 4; // DT_PLTGOT, DT_PLTRELSZ, DT_PLTREL, DT_JMPREL
+        }
+        if ($relaDynSize > 0) {
+            $numDynEntries += 3; // DT_RELA, DT_RELASZ, DT_RELAENT
+        }
+        $dynamicSize = $numDynEntries * 16;
+        $bssVAddr = self::BASE_ADDR + $dynamicFileOff + $dynamicSize;
 
         $vaddrs = [
             '.text'   => $textVAddr,

@@ -11,8 +11,9 @@ class Relocation
     public const R_X86_64_PC32         = 2;   // REL32
     public const R_X86_64_PLT32        = 4;   // call to PLT entry
     public const R_X86_64_GOTPCREL     = 9;   // GOT-relative
-    public const R_X86_64_32S          = 11;  // sign-extended 32-bit absolute
-    public const R_X86_64_REX_GOTPCREL = 42;  // GOT-relative with REX prefix (AMD64 extension)
+    public const R_X86_64_32S             = 11;  // sign-extended 32-bit absolute
+    public const R_X86_64_GOTPCRELX      = 41;  // relaxable GOT-relative (x86-64 psABI)
+    public const R_X86_64_REX_GOTPCRELX  = 42;  // relaxable GOT-relative with REX prefix
 
     public function __construct(
         public string $section,
