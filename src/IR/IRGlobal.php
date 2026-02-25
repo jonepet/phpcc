@@ -12,5 +12,6 @@ class IRGlobal
         public readonly int $size,
         public readonly ?string $initValue = null,
         public readonly ?string $stringData = null,
+        public readonly bool $isLocal = false,
     ) {}
 }

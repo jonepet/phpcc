@@ -17,6 +17,9 @@ use Cppc\Assembler\Parser as AsmParser;
 use Cppc\Assembler\Encoder;
 use Cppc\Assembler\Linker;
 use Cppc\Assembler\ElfWriter;
+use Cppc\Assembler\ElfReader;
+use Cppc\Assembler\DynSymReader;
+use Cppc\Assembler\GotPltBuilder;
 
 class Compiler
 {
@@ -249,7 +252,7 @@ class Compiler
     }
 
     /**
-     * Link object files with system gcc/g++.
+     * Link with dynamic linking (requires CRT objects from system).
      *
      * @param string[] $objectFiles
      * @param string[] $libraries  e.g. ['m', 'pthread']
@@ -257,26 +260,158 @@ class Compiler
      */
     public function link(array $objectFiles, string $outputPath, array $libraries = [], array $libPaths = []): void
     {
-        $parts = ['gcc', '-o', escapeshellarg($outputPath), '-no-pie'];
-        foreach ($objectFiles as $o) {
-            $parts[] = escapeshellarg($o);
-        }
-        foreach ($libPaths as $p) {
-            $parts[] = '-L' . escapeshellarg($p);
-        }
-        foreach ($libraries as $l) {
-            $parts[] = '-l' . escapeshellarg($l);
-        }
-        foreach ($this->extraLinkerFlags as $f) {
-            $parts[] = $f;
+        $elfReader = new ElfReader();
+        $dynSymReader = new DynSymReader();
+        $linker = new Linker();
+
+        // Read CRT objects for proper _start entry
+        $crtPaths = $this->findCrtObjects();
+        $crtOrder = ['crt1.o', 'crti.o']; // prefix
+        $crtSuffix = ['crtn.o'];           // suffix
+
+        foreach ($crtOrder as $crtName) {
+            if (isset($crtPaths[$crtName])) {
+                $module = $elfReader->readFile($crtPaths[$crtName]);
+                $linker->addModule($module['sections'], $module['globals']);
+            }
         }
 
-        $cmd = implode(' ', $parts) . ' 2>&1';
-        exec($cmd, $output, $exitCode);
-
-        if ($exitCode !== 0) {
-            throw new CompileError("Linker failed: " . implode("\n", $output));
+        // Read user object files
+        foreach ($objectFiles as $objPath) {
+            $module = $elfReader->readFile($objPath);
+            $linker->addModule($module['sections'], $module['globals']);
         }
+
+        // Read CRT suffix
+        foreach ($crtSuffix as $crtName) {
+            if (isset($crtPaths[$crtName])) {
+                $module = $elfReader->readFile($crtPaths[$crtName]);
+                $linker->addModule($module['sections'], $module['globals']);
+            }
+        }
+
+        // Resolve library symbols
+        $neededLibs = ['libc.so.6']; // Always need libc
+        $availableExternals = [];
+
+        foreach ($libraries as $lib) {
+            $soPath = $dynSymReader->findLibrary($lib, $libPaths);
+            if ($soPath !== null) {
+                $exports = $dynSymReader->readFile($soPath);
+                foreach ($exports as $sym) {
+                    $availableExternals[$sym] = true;
+                }
+                // Determine .so name for DT_NEEDED
+                $soName = basename($soPath);
+                // Extract SONAME pattern: libfoo.so.N
+                if (!in_array($soName, $neededLibs, true) && $soName !== 'libc.so.6') {
+                    $neededLibs[] = $soName;
+                }
+            }
+        }
+
+        // Also read libc exports
+        $libcPath = $dynSymReader->findLibrary('c', $libPaths);
+        if ($libcPath !== null) {
+            $exports = $dynSymReader->readFile($libcPath);
+            foreach ($exports as $sym) {
+                $availableExternals[$sym] = true;
+            }
+        }
+
+        // Find undefined symbols and classify as dynamic
+        $undefined = $linker->findUndefinedSymbols();
+        $gotPlt = new GotPltBuilder();
+        
+        // Scan for GOTPCREL relocations — these need GOT entries (PIC code)
+        // Both defined and undefined symbols referenced via GOTPCREL need GOT entries
+        $gotpcrelSymbols = [];
+        foreach ($linker->getSections() as $sec) {
+            foreach ($sec->relocs as $reloc) {
+                if ($reloc->type === 'GOTPCREL') {
+                    $gotpcrelSymbols[$reloc->target] = true;
+                    // Only mark undefined symbols as dynamic
+                    if (!isset($linker->getSymbols()[$reloc->target])) {
+                        $linker->markDynamic($reloc->target);
+                    }
+                }
+            }
+        }
+
+        // Add GOT entries for all GOTPCREL symbols (both defined and undefined)
+        foreach (array_keys($gotpcrelSymbols) as $name) {
+            $gotPlt->addGotDataSymbol($name);
+        }
+
+        // Add PLT entries for other undefined symbols (function calls via jmp, not GOTPCREL)
+        foreach ($undefined as $name) {
+            if (!isset($gotpcrelSymbols[$name])) {
+                // Regular PLT for function calls
+                $linker->markDynamic($name);
+                $gotPlt->addPltSymbol($name);
+            }
+        }
+
+        // Compute layout
+        $layout = ElfWriter::computeDynLayout($linker, $gotPlt);
+
+        // Build PLT address map for relocation resolution
+        $pltAddrs = [];
+        foreach ($gotPlt->getPltSymbols() as $name) {
+            $pltAddrs[$name] = $gotPlt->getPltEntryAddr($name, $layout['pltVAddr']);
+        }
+
+        // Build GOT address map for relocation resolution
+        $gotAddrs = [];
+        foreach ($gotPlt->getGotDataSymbols() as $name) {
+            $gotAddrs[$name] = $gotPlt->getGotEntryAddr($name, $layout['gotVAddr']);
+        }
+
+        // Resolve relocations (local symbols + PLT + GOT redirects)
+        $linker->resolve($layout['vaddrs'], $pltAddrs, $gotAddrs);
+
+        // Build final ELF
+        $elfWriter = new ElfWriter();
+        $binary = $elfWriter->buildDynExecutable(
+            $linker->getSections(),
+            $layout['entry'] ?? throw new CompileError('No entry point found'),
+            $layout['vaddrs'],
+            $gotPlt,
+            $neededLibs,
+        );
+
+        file_put_contents($outputPath, $binary);
+        chmod($outputPath, 0755);
+    }
+
+    /**
+     * Find CRT object files in standard system directories.
+     *
+     * @return array<string, string> CRT name → full path
+     */
+    private function findCrtObjects(): array
+    {
+        $crtNames = ['crt1.o', 'crti.o', 'crtn.o'];
+        $searchPaths = [
+            '/usr/lib/x86_64-linux-gnu',
+            '/usr/lib64',
+            '/usr/lib',
+            '/lib/x86_64-linux-gnu',
+            '/lib64',
+        ];
+
+        $found = [];
+        foreach ($crtNames as $name) {
+            foreach ($searchPaths as $dir) {
+                $path = "{$dir}/{$name}";
+                if (file_exists($path)) {
+                    $found[$name] = $path;
+                    break;
+                }
+            }
+        }
+
+        return $found;
     }
 
     public function dumpAst(TranslationUnit $ast): string

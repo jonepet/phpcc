@@ -25,9 +25,9 @@ class IRModule
         $this->functions[] = $func;
     }
 
-    public function addGlobal(string $name, string $type, int $size, ?string $initValue = null, ?string $stringData = null): void
+    public function addGlobal(string $name, string $type, int $size, ?string $initValue = null, ?string $stringData = null, bool $isLocal = false): void
     {
-        $this->globals[] = new IRGlobal($name, $type, $size, $initValue, $stringData);
+        $this->globals[] = new IRGlobal($name, $type, $size, $initValue, $stringData, $isLocal);
     }
 
     public function addString(string $value): string

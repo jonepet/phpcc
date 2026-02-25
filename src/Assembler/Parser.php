@@ -125,8 +125,25 @@ class Parser
                 $globals[] = trim($rest);
                 return;
             case '.type':
+                // .type funcname, @function → type_meta directive
+                $parts = array_map('trim', explode(',', $rest, 2));
+                if (count($parts) === 2) {
+                    $typeName = ltrim($parts[1], '@');
+                    $item = new AsmLine();
+                    $item->directive = 'type_meta';
+                    $item->directiveArgs = [$parts[0], $typeName];
+                    $sections[$current][] = $item;
+                }
+                return;
             case '.size':
-                // Ignored — not needed for binary output
+                // .size funcname, .-funcname → size_meta directive
+                $parts = array_map('trim', explode(',', $rest, 2));
+                if (count($parts) === 2) {
+                    $item = new AsmLine();
+                    $item->directive = 'size_meta';
+                    $item->directiveArgs = [$parts[0], $parts[1]];
+                    $sections[$current][] = $item;
+                }
                 return;
             case '.align':
                 $item = new AsmLine();
@@ -267,16 +284,30 @@ class Parser
 
             $innerParts = explode(',', $inner);
 
-            // RIP-relative: label(%rip) or label+offset(%rip)
+            // RIP-relative: label(%rip) or label+offset(%rip) or label@GOTPCREL(%rip)
             if (count($innerParts) === 1 && trim($innerParts[0]) === '%rip') {
                 $addend = 0;
                 $label = $prefix;
-                $plusPos = strpos($prefix, '+');
-                if ($plusPos !== false) {
-                    $label = substr($prefix, 0, $plusPos);
-                    $addend = (int)substr($prefix, $plusPos + 1);
+                $suffix = '';
+
+                // Check for @GOTPCREL suffix
+                $atPos = strpos($label, '@');
+                if ($atPos !== false) {
+                    $suffix = substr($label, $atPos + 1);
+                    $label = substr($label, 0, $atPos);
                 }
-                return Operand::ripRel($label, $addend);
+
+                $plusPos = strpos($label, '+');
+                if ($plusPos !== false) {
+                    $addend = (int)substr($label, $plusPos + 1);
+                    $label = substr($label, 0, $plusPos);
+                }
+
+                $op = Operand::ripRel($label, $addend);
+                if ($suffix !== '') {
+                    $op->suffix = $suffix;
+                }
+                return $op;
             }
 
             // Parse base register
@@ -301,8 +332,18 @@ class Parser
             return Operand::memory($base, $disp);
         }
 
-        // Bare label (for call/jmp targets)
-        return Operand::label($s);
+        // Bare label (for call/jmp targets), with optional @PLT suffix
+        $suffix = '';
+        $atPos = strpos($s, '@');
+        if ($atPos !== false) {
+            $suffix = substr($s, $atPos + 1);
+            $s = substr($s, 0, $atPos);
+        }
+        $op = Operand::label($s);
+        if ($suffix !== '') {
+            $op->suffix = $suffix;
+        }
+        return $op;
     }
 
     private function parseImmediateValue(string $val): int

@@ -3,6 +3,8 @@
 
 declare(strict_types=1);
 
+ini_set('memory_limit', '1G');
+
 // Find autoloader
 $autoloadPaths = [
     __DIR__ . '/../vendor/autoload.php',
@@ -28,14 +30,15 @@ use Cppc\ContainerFactory;
 
 function usage(): void
 {
-    fwrite(STDERR, "Usage: cppc <input.cpp> [-o <output>] [-S] [--emit-ast] [--emit-ir] [--emit-tokens]\n");
+    fwrite(STDERR, "Usage: cppc <input.cpp> [-o <output>] [-S] [-c] [--emit-ast] [--emit-ir] [--emit-tokens]\n");
     fwrite(STDERR, "\nOptions:\n");
-    fwrite(STDERR, "  -o <file>       Output file (default: a.out for binary, stdout for -S)\n");
-    fwrite(STDERR, "  -S, --emit-asm  Emit assembly text instead of binary\n");
-    fwrite(STDERR, "  --emit-tokens   Print token stream and exit\n");
-    fwrite(STDERR, "  --emit-ast      Print AST and exit\n");
-    fwrite(STDERR, "  --emit-ir       Print IR and exit\n");
-    fwrite(STDERR, "  -h, --help      Show this help\n");
+    fwrite(STDERR, "  -o <file>          Output file (default: a.out for binary, stdout for -S)\n");
+    fwrite(STDERR, "  -S, --emit-asm     Emit assembly text instead of binary\n");
+    fwrite(STDERR, "  -c, --emit-object  Compile to .o object file\n");
+    fwrite(STDERR, "  --emit-tokens      Print token stream and exit\n");
+    fwrite(STDERR, "  --emit-ast         Print AST and exit\n");
+    fwrite(STDERR, "  --emit-ir          Print IR and exit\n");
+    fwrite(STDERR, "  -h, --help         Show this help\n");
     exit(1);
 }
 
@@ -50,6 +53,7 @@ $emitTokens = false;
 $emitAst = false;
 $emitIr = false;
 $emitAsm = false;
+$emitObject = false;
 
 for ($i = 0; $i < count($args); $i++) {
     switch ($args[$i]) {
@@ -59,6 +63,10 @@ for ($i = 0; $i < count($args); $i++) {
         case '-S':
         case '--emit-asm':
             $emitAsm = true;
+            break;
+        case '-c':
+        case '--emit-object':
+            $emitObject = true;
             break;
         case '--emit-tokens':
             $emitTokens = true;
@@ -116,6 +124,20 @@ try {
     if ($emitIr) {
         $ir = $compiler->generateIr($source, $inputFile, $sourceDir);
         echo $ir;
+        exit(0);
+    }
+
+    if ($emitObject) {
+        $outPath = $outputFile ?? pathinfo($inputFile, PATHINFO_FILENAME) . '.o';
+        $ext = strtolower(pathinfo($inputFile, PATHINFO_EXTENSION));
+        if ($ext === 'asm' || $ext === 's') {
+            // Raw assembly file — assemble directly
+            $compiler->assembleToObject($source, $outPath);
+        } else {
+            // Source file — compile then assemble
+            $compiler->compileToObject($source, $inputFile, $sourceDir, $outPath);
+        }
+        fwrite(STDERR, "Object file written to {$outPath}\n");
         exit(0);
     }
 

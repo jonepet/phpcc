@@ -15,6 +15,8 @@
 
 declare(strict_types=1);
 
+ini_set('memory_limit', '1G');
+
 $autoloadPaths = [
     __DIR__ . '/../vendor/autoload.php',
     '/app/vendor/autoload.php',
@@ -65,7 +67,15 @@ $linkerFlags     = [];      // -Wl,... flags
 $depFile         = null;    // -MF file
 $genDeps         = false;   // -M / -MD / -MMD
 $extraLinkFlags  = [];      // -shared, -static, -fPIC passthrough
+$extraAsmFlags   = [];      // -fPIC passthrough to assembler
 $strictUndeclared = false;  // -Werror=implicit-function-declaration
+
+// Auto-add host library paths (mounted to /host-libs/ to avoid conflicts with container libs).
+foreach (['/host-libs/x86_64-linux-gnu'] as $_sysLib) {
+    if (is_dir($_sysLib)) {
+        $libPaths[] = $_sysLib;
+    }
+}
 
 $argc = count($args);
 
@@ -143,13 +153,9 @@ for ($i = 0; $i < $argc; $i++) {
     }
 
     // ── -Wl,... linker flag passthrough ─────────────────────────────────
+    // Pass the entire -Wl,... flag through to gcc unchanged.
     if (str_starts_with($arg, '-Wl,')) {
-        $wlFlags = explode(',', substr($arg, 4));
-        foreach ($wlFlags as $f) {
-            if ($f !== '') {
-                $linkerFlags[] = $f;
-            }
-        }
+        $linkerFlags[] = $arg;
         continue;
     }
 
@@ -160,6 +166,7 @@ for ($i = 0; $i < $argc; $i++) {
     }
     if ($arg === '-fPIC' || $arg === '-fpic' || $arg === '-fPIE' || $arg === '-fpie') {
         $extraLinkFlags[] = $arg;
+        $extraAsmFlags[] = $arg;
         continue;
     }
 
@@ -250,6 +257,9 @@ if ($strictUndeclared) {
 }
 foreach ($extraLinkFlags as $f) {
     $compiler->addLinkerFlag($f);
+}
+foreach ($extraAsmFlags as $f) {
+    $compiler->addAsmFlag($f);
 }
 
 // ── Link-only mode: all inputs are object files ──────────────────────────────
@@ -342,6 +352,30 @@ function findRuntimeCompat(): ?string
             return $c;
         }
     }
+
+    // Auto-assemble from .asm source if .o doesn't exist
+    $asmCandidates = [
+        __DIR__ . '/../runtime/runtime_compat.asm',
+        '/app/runtime/runtime_compat.asm',
+    ];
+    foreach ($asmCandidates as $asmPath) {
+        if (file_exists($asmPath)) {
+            $container = \Cppc\ContainerFactory::create();
+            $compiler = $container->get(\Cppc\Compiler::class);
+            $asmSource = file_get_contents($asmPath);
+            $oPath = dirname($asmPath) . '/runtime_compat.o';
+            try {
+                $compiler->assembleToObject($asmSource, $oPath);
+                return $oPath;
+            } catch (\Throwable $e) {
+                // Fallback: write to temp dir
+                $tmpPath = sys_get_temp_dir() . '/cppc_runtime_compat.o';
+                $compiler->assembleToObject($asmSource, $tmpPath);
+                return $tmpPath;
+            }
+        }
+    }
+
     return null;
 }
 

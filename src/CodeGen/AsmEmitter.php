@@ -14,17 +14,18 @@ namespace Cppc\CodeGen;
  */
 class AsmEmitter
 {
-    private string $output = '';
+    /** @var string[] */
+    private array $lines = [];
     private int $indentLevel = 0;
 
     public function getOutput(): string
     {
-        return $this->output;
+        return implode("\n", $this->lines) . "\n";
     }
 
     public function reset(): void
     {
-        $this->output     = '';
+        $this->lines = [];
         $this->indentLevel = 0;
     }
 
@@ -42,7 +43,7 @@ class AsmEmitter
 
     private function line(string $text): void
     {
-        $this->output .= str_repeat('    ', $this->indentLevel) . $text . "\n";
+        $this->lines[] = str_repeat('    ', $this->indentLevel) . $text;
     }
 
     public function section(string $name): void
@@ -128,7 +129,7 @@ class AsmEmitter
 
     public function blank(): void
     {
-        $this->output .= "\n";
+        $this->lines[] = '';
     }
 
     public function emit(string $mnemonic, string ...$operands): void
@@ -277,6 +278,9 @@ class AsmEmitter
 
     public function reg(string $name): string
     {
+        if (str_starts_with($name, '%')) {
+            return $name;
+        }
         return '%' . $name;
     }
 

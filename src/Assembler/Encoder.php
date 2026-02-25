@@ -12,6 +12,10 @@ class Encoder
     /** @var array<string, int> */
     private array $labels = [];
     private string $sectionName = '';
+    /** @var array<string, string> symbol name → type ('func','object','notype') */
+    private array $symbolTypes = [];
+    /** @var array<string, int> symbol name → size */
+    private array $symbolSizes = [];
 
     private const REG_NUM = [
         'rax' => 0, 'eax' => 0, 'ax' => 0, 'al' => 0,
@@ -47,6 +51,8 @@ class Encoder
         $this->relocs = [];
         $this->labels = [];
         $this->sectionName = $sectionName;
+        $this->symbolTypes = [];
+        $this->symbolSizes = [];
 
         foreach ($lines as $line) {
             if ($line->label !== null) {
@@ -66,7 +72,9 @@ class Encoder
         $section->bytes = $this->bytes;
         $section->relocs = $this->relocs;
         foreach ($this->labels as $name => $offset) {
-            $section->symbols[] = new Symbol($name, $sectionName, $offset);
+            $type = $this->symbolTypes[$name] ?? 'notype';
+            $size = $this->symbolSizes[$name] ?? 0;
+            $section->symbols[] = new Symbol($name, $sectionName, $offset, type: $type, size: $size);
         }
         return $section;
     }
@@ -130,6 +138,30 @@ class Encoder
                 $cur = strlen($this->bytes);
                 $pad = ($align - ($cur % $align)) % $align;
                 $this->bytes .= str_repeat("\0", $pad);
+                break;
+            case 'type_meta':
+                // [symbolName, typeName] e.g. ['main', 'function']
+                $args = $line->directiveArgs;
+                $elfType = match ($args[1]) {
+                    'function' => 'func',
+                    'object' => 'object',
+                    default => 'notype',
+                };
+                $this->symbolTypes[$args[0]] = $elfType;
+                break;
+            case 'size_meta':
+                // [symbolName, sizeExpr] e.g. ['main', '.-main']
+                $args = $line->directiveArgs;
+                $sizeExpr = $args[1];
+                // Handle '.-symbolName' pattern
+                if (str_starts_with($sizeExpr, '.-')) {
+                    $refLabel = substr($sizeExpr, 2);
+                    if (isset($this->labels[$refLabel])) {
+                        $this->symbolSizes[$args[0]] = strlen($this->bytes) - $this->labels[$refLabel];
+                    }
+                } elseif (ctype_digit($sizeExpr)) {
+                    $this->symbolSizes[$args[0]] = (int)$sizeExpr;
+                }
                 break;
         }
     }
@@ -608,10 +640,11 @@ class Encoder
     {
         if ($op->kind === OperandKind::Label) {
             $this->emit8(0xE8);
+            $relocType = ($op->suffix === 'PLT') ? 'PLT32' : 'REL32';
             $this->relocs[] = new Relocation(
                 $this->sectionName,
                 strlen($this->bytes),
-                'REL32',
+                $relocType,
                 $op->label,
             );
             $this->emitLE32(0);
@@ -630,10 +663,11 @@ class Encoder
     {
         if ($op->kind === OperandKind::Label) {
             $this->emit8(0xE9);
+            $relocType = ($op->suffix === 'PLT') ? 'PLT32' : 'REL32';
             $this->relocs[] = new Relocation(
                 $this->sectionName,
                 strlen($this->bytes),
-                'REL32',
+                $relocType,
                 $op->label,
             );
             $this->emitLE32(0);
@@ -895,10 +929,15 @@ class Encoder
         if ($rm->kind === OperandKind::RipRel) {
             // mod=00, rm=5 → RIP-relative with disp32
             $this->emit8(0x00 | ($reg3 << 3) | 5);
+            $relocType = match ($rm->suffix) {
+                'GOTPCREL' => 'GOTPCREL',
+                'PLT' => 'PLT32',
+                default => 'REL32',
+            };
             $this->relocs[] = new Relocation(
                 $this->sectionName,
                 strlen($this->bytes),
-                'REL32',
+                $relocType,
                 $rm->label,
                 $rm->disp,
             );

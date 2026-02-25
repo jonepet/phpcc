@@ -63,10 +63,21 @@ rewrite_arg() {
     esac
 }
 
-# Mount host system include/lib directories so the compiler can find system headers.
+# Mount host system include/lib directories so the compiler can find headers and libraries.
+# NOTE: Do NOT mount /usr/lib/x86_64-linux-gnu or /lib/x86_64-linux-gnu — they
+# conflict with the container's own libraries (e.g., libxml2 needed by PHP).
+# Instead, individual library .so/.a files are accessed via the symlink directory below.
 for _sys_dir in /usr/include /usr/lib/gcc; do
     [ -d "$_sys_dir" ] && ensure_mounted "$_sys_dir"
 done
+
+# Expose host dev libraries via a non-conflicting mount point.
+_HOST_LIBDIR="/usr/lib/x86_64-linux-gnu"
+_GUEST_HOSTLIBS="/host-libs/x86_64-linux-gnu"
+if [ -d "$_HOST_LIBDIR" ]; then
+    DOCKER_EXTRA+=(-v "$_HOST_LIBDIR:$_GUEST_HOSTLIBS:ro")
+    MOUNTED_DIRS[$_HOST_LIBDIR]=1
+fi
 
 # Map CWD into the container.
 case "$HOST_CWD" in

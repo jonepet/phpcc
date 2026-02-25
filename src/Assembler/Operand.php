@@ -14,6 +14,7 @@ class Operand
     public int $scale = 1;
     public int $disp = 0;
     public string $label = '';
+    public string $suffix = '';  // @PLT, @GOTPCREL
 
     public static function register(string $reg): self
     {

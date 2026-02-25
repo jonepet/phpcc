@@ -23,6 +23,7 @@ class IRFunction
         public readonly string $returnType = 'int',
         public readonly int $returnSize = 8,
         public readonly bool $returnIsFloat = false,
+        public readonly bool $isLocal = false,
     ) {}
 
     public function newVReg(int $size = 8): Operand

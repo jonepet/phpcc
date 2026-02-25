@@ -137,7 +137,8 @@ class IRGenerator
         $returnSize    = $this->getTypeSize($node->returnType);
         $returnTypeStr = (string)$node->returnType;
 
-        $irFunc = new IRFunction($mangledName, $returnTypeStr, $returnSize, $returnIsFloat);
+        $isLocal = $node->returnType->isStatic || $node->isStatic;
+        $irFunc = new IRFunction($mangledName, $returnTypeStr, $returnSize, $returnIsFloat, $isLocal);
 
         if ($node->className !== null && !$node->isStatic) {
             // Implicit this pointer as first parameter.
@@ -298,7 +299,8 @@ class IRGenerator
             $initValue = $label;
         }
 
-        $this->module->addGlobal($node->name, $typeStr, $size, $initValue);
+        $isLocal = $node->type->isStatic;
+        $this->module->addGlobal($node->name, $typeStr, $size, $initValue, isLocal: $isLocal);
         $this->globalVars[$node->name] = true;
 
         // Non-constant initializer: generate an __init function to run at module load.
@@ -749,7 +751,7 @@ class IRGenerator
                 $initValue = $label;
             }
 
-            $this->module->addGlobal($mangledName, (string)$node->type, $totalSize, $initValue, $stringData);
+            $this->module->addGlobal($mangledName, (string)$node->type, $totalSize, $initValue, $stringData, isLocal: true);
             $this->globalVars[$mangledName] = true;
             $this->staticLocalMap[$node->name] = $mangledName;
             return;

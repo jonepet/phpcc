@@ -20,6 +20,6 @@ RUN composer install --no-dev --optimize-autoloader --no-scripts
 COPY . /app/
 RUN composer dump-autoload --optimize --no-dev
 
-RUN gcc -c -o /app/runtime/runtime_compat.o /app/runtime/runtime_compat.c
+RUN php /app/bin/cppc --emit-object /app/runtime/runtime_compat.asm -o /app/runtime/runtime_compat.o
 
 ENTRYPOINT ["php"]

@@ -31,9 +31,12 @@ class X86Generator
     private array $usedCalleeSaved = [];
     private int $frameSize = 0;
     private int $floatConstCounter = 0;
+    private bool $picMode = false;
 
     /** Float constants emitted to .rodata: label → raw bit pattern. */
     private array $floatConsts = [];
+    /** @var array<string, true> Local function names in this module */
+    private array $localFunctions = [];
 
     /**
      * Maps a 64-bit GP register to its sub-register names.
@@ -60,11 +63,12 @@ class X86Generator
         'r15'  => ['r15',  'r15d', 'r15w', 'r15b'],
     ];
 
-    public function __construct()
+    public function __construct(bool $picMode = false)
     {
         $this->emitter    = new AsmEmitter();
         $this->allocator  = new RegisterAllocator();
         $this->convention = new CallingConvention();
+        $this->picMode    = $picMode;
     }
 
     public function generate(IRModule $module): string
@@ -72,6 +76,10 @@ class X86Generator
         $this->emitter->reset();
         $this->floatConsts       = [];
         $this->floatConstCounter = 0;
+        $this->localFunctions    = [];
+        foreach ($module->functions as $func) {
+            $this->localFunctions[$func->name] = true;
+        }
 
         // ── .data ──────────────────────────────────────────────────────────
         $initGlobals = array_filter(
@@ -82,7 +90,9 @@ class X86Generator
             $this->emitter->data();
             $this->emitter->align(8);
             foreach ($initGlobals as $global) {
-                $this->emitter->global($global->name);
+                if (!$global->isLocal) {
+                    $this->emitter->global($global->name);
+                }
                 $this->emitter->type($global->name, 'object');
                 $this->emitter->label($global->name);
                 $this->emitGlobalData($global);
@@ -100,7 +110,9 @@ class X86Generator
             $this->emitter->bss();
             $this->emitter->align(8);
             foreach ($bssGlobals as $global) {
-                $this->emitter->global($global->name);
+                if (!$global->isLocal) {
+                    $this->emitter->global($global->name);
+                }
                 $this->emitter->type($global->name, 'object');
                 $this->emitter->label($global->name);
                 $this->emitter->zero($global->size);
@@ -210,7 +222,9 @@ class X86Generator
 
         // ── Function header ────────────────────────────────────────────────
         $this->emitter->blank();
-        $this->emitter->global($func->name);
+        if (!$func->isLocal) {
+            $this->emitter->global($func->name);
+        }
         $this->emitter->type($func->name, 'function');
         $this->emitter->label($func->name);
 
@@ -1194,7 +1208,12 @@ class X86Generator
             }
             $this->emitter->emit('call', '*' . $this->emitter->reg($fnReg));
         } else {
-            $this->emitter->call($funcName);
+            $callTarget = $funcName;
+            // In PIC mode, external function calls go through PLT
+            if ($this->picMode && !$this->isLocalFunction($funcName)) {
+                $callTarget = $funcName . '@PLT';
+            }
+            $this->emitter->call($callTarget);
         }
 
         // ── Clean up stack arguments ───────────────────────────────────────
@@ -1510,8 +1529,8 @@ class X86Generator
             return $this->emitter->mem('rbp', $offset);
         }
 
-        // Physical register name.
-        return $loc;
+        // Physical register name → AT&T format with % prefix.
+        return $this->emitter->reg($loc);
     }
 
     /** Returns $loc if it is a GP register, otherwise returns the $fallback scratch register. */
@@ -1567,6 +1586,14 @@ class X86Generator
     {
         $name = ltrim($loc, '%');
         return isset(self::REG_SIZES[$name]);
+    }
+
+    /**
+     * Check if a function name is defined locally in this module.
+     */
+    private function isLocalFunction(string $name): bool
+    {
+        return isset($this->localFunctions[$name]);
     }
 
     private function isXmmReg(string $loc): bool
